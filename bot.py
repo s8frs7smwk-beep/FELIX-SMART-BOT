@@ -1,61 +1,43 @@
 """
-POCKET TA BOT — сигналы по классическому техническому анализу (Pocket Option OTC)
-+ EXPRESS-РЕЖИМ (добавлено отдельной кнопкой, работает на общем движке анализа)
+FELIX SMART BOT — сигналы по стратегии «Не заходи раньше» (Smart Money / SMC)
+на котировках Pocket Option. Только РЕАЛЬНЫЕ (не OTC) основные валютные пары.
 
---- БАЗОВЫЙ РЕЖИМ (как было) ---
-Факторы уверенности (сумма нормируется к 100%, максимум 110 баллов сырых):
-1. Уровни поддержки/сопротивления (макс 30) — по кластеру локальных экстремумов на M5.
-   С поправкой на "истощение": пик силы на 3-4 касаниях, после — уровень чаще пробивают,
-   а не держит, поэтому балл после 4 касаний снижается, а не растёт бесконечно.
-2. Свечной паттерн у уровня (макс 30) — пин-бар, поглощение, доджи.
-3. Активность (тики цены за свечу) относительно среднего (макс 25).
-4. Совпадение с трендом M15 по EMA20/50 (макс 15, бонус).
-5. Качество подхода к уровню (макс 10, бонус) — направленное движение в 3 свечи перед
-   сигнальной свечой считается более убедительным, чем касание после бокового шума.
+ЛОГИКА (старший ТФ H1 + младший ТФ M5):
+H1:
+ 1. Тренд по структуре: HH + HL — восходящий, LH + LL — нисходящий
+    (если структура смешанная — запасной вариант по EMA20/EMA50).
+ 2. Снятие ликвидности: свеча H1 прокалывает предыдущий минимум (для покупки)
+    или максимум (для продажи).
+ 3. Импульс с имбалансом: сразу после снятия — сильная свеча по тренду,
+    оставившая FVG (разрыв между 1-й и 3-й свечой).
+ 4. «Не заходи раньше»: на импульсе НЕ входим, ждём возврата цены в зону FVG.
+    FVG считается сломанным, если свеча H1 закрылась за его дальней границей.
+M5 (пока цена вернулась в FVG):
+ 5. Снятие локальной ликвидности — прокол локального минимума/максимума M5
+    внутри или у зоны FVG.
+ 6. Слом структуры (BOS) — закрытие M5 за локальным максимумом/минимумом.
+    На закрытии этой свечи приходит сигнал: вход сразу.
 
-Сигнал уходит только если уверенность >= CONFIDENCE_THRESHOLD (70%).
-Экспирация сигнала — 5 минут. Cooldown не даёт слать повторно тот же
-актив+направление слишком часто. Бот работает только в заданное окно
-времени по Норвегии (Europe/Oslo).
+Экспирация сигнала — 30 минут. Бот сам проверяет цену через 15 / 30 / 60 минут
+и ведёт статистику (/stats). Один и тот же FVG даёт максимум один сигнал.
 
-СТАТИСТИКА: бот запоминает каждый отправленный сигнал и через 5 минут
-сверяет цену с ценой на момент сигнала — угадал/не угадал. /stats показывает
-точность. Circuit breaker: если из последних 10 проверенных сигналов угадано
-меньше 40% — бот присылает предупреждение.
+Свечи M5 и H1 бот собирает сам из потока котировок + подгружает историю при
+старте. Команда /candles показывает, сколько свечей накоплено по каждой паре.
 
---- EXPRESS-РЕЖИМ (добавлено) ---
-Отдельная кнопка "🎯 Express" / команда /express — собирает СЕТ из 3 активов
-одновременно (Pocket Option требует минимум 3 актива для express-сделки),
-используя тот же движок анализа (уровни+паттерн+активность+тренд+подход), но:
-- Свой пул активов (акции OTC: Microsoft, Pfizer, Citigroup и т.д.) —
-  ключевые слова в EXPRESS_ASSET_KEYWORDS, бот сам находит точные enum-имена
-  в библиотеке при старте (не хардкодится, т.к. точные названия заранее
-  неизвестны — см. resolve_express_pool()).
-- Фильтр по выплате (payout) в диапазоне PAYOUT_MIN..PAYOUT_MAX. Живой поток
-  payout от библиотеки не подключён (неизвестно точное событие) — используется
-  РУЧНОЙ снэпшот (EXPRESS_PAYOUT_SNAPSHOT), обновляемый командой /setpayout.
-- Своя экспирация (EXPRESS_EXPIRATION_SECONDS, 3 мин) и свой интервал
-  автоанализа (EXPRESS_INTERVAL_SECONDS, 10 мин) — оба отдельные от обычного
-  режима (5 мин / 1 мин), запускаются и останавливаются отдельными кнопками,
-  не мешая обычному режиму.
-- Если в моменте набралось МЕНЬШЕ 3 активов, прошедших порог уверенности —
-  сет не отправляется (лучше пропустить тик).
-- Статистика express — отдельно, /stats показывает и обычную точность, и
-  отдельно % сетов, где зашли ВСЕ 3 актива (это и есть реальный express-winrate).
+ВАЖНО: реальные валютные пары не торгуются в выходные — с вечера пятницы до
+вечера воскресенья котировок не будет, это нормально.
 
---- ИСПРАВЛЕНИЯ (26.09.2026) ---
-- Патч библиотеки pocket_option: fix_timestamp падал с
-  "TypeError: Unsupported type: <class 'int'>" на событии updateStream,
-  из-за чего котировки вообще не доходили до бота. Теперь int/float
-  обрабатываются (см. _patch_pocket_option_timestamp()).
-- В обработчике котировок актив приводится к тому же ключу, что и при
-  анализе (_asset_key). Раньше str(Asset.X) мог давать "Asset.X" вместо
-  "X", и свечи копились под одним именем, а анализ искал под другим.
+Исправления библиотеки pocket_option (перенесены из рабочего кода):
+- патч fix_timestamp (TypeError: Unsupported type: <class 'int'>);
+- единый ключ актива в хранилище свечей и в анализе;
+- подгрузка истории через реальную сигнатуру load_history_period
+  с запасными вариантами вызова и таймаутом.
 """
 
 import os
 import sys
 import time
+import inspect
 import asyncio
 from collections import deque
 from datetime import datetime, timezone, timedelta
@@ -76,9 +58,8 @@ from pocket_option.models import Asset, AuthorizationData, UpdateCloseValueItem
 # ---------------------------------------------------------------------------
 
 def _patch_pocket_option_timestamp():
-    """Библиотечная fix_timestamp не принимает int, а сервер присылает
-    время именно как int. Подменяем функцию во всех модулях pocket_option,
-    которые её импортировали (utils, middlewares и др.)."""
+    """Библиотечная fix_timestamp не принимает int, а сервер присылает время
+    именно как int. Подменяем функцию во всех модулях pocket_option."""
     try:
         import pocket_option.utils as po_utils
         import pocket_option.middlewares  # noqa: F401 — чтобы модуль точно был загружен
@@ -123,7 +104,7 @@ _patch_pocket_option_timestamp()
 
 
 # ---------------------------------------------------------------------------
-# КОНФИГ — БАЗОВЫЙ РЕЖИМ (без изменений)
+# КОНФИГ
 # ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -133,27 +114,38 @@ PO_SESSION = os.getenv("PO_SESSION")
 PO_UID = os.getenv("PO_UID")
 PO_IS_DEMO = 1
 
-ASSETS = [
-    Asset.EURUSD_otc,
-    Asset.GBPUSD_otc,
-    Asset.AUDCAD_otc,
-]
+# Основные валютные пары (без золота и индексов). Точные имена в библиотеке
+# ищутся при старте — см. resolve_pairs().
+PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD"]
 
-EXPIRATION_SECONDS = 300  # 5 минут
-TF_M5 = 5 * 60
-TF_M15 = 15 * 60
+TF_LTF = 5 * 60        # M5 — младший ТФ (подтверждение)
+TF_HTF = 60 * 60       # H1 — старший ТФ (тренд, ликвидность, FVG)
 
-AUTO_ANALYSIS_INTERVAL = 60
-CONFIDENCE_THRESHOLD = 70
-STRONG_SIGNAL_THRESHOLD = 85
-SCORE_MAX = 110  # 30 (уровень) + 30 (паттерн) + 25 (активность) + 15 (тренд) + 10 (подход)
+MAX_LTF_CANDLES = 600
+MAX_HTF_CANDLES = 200
+HISTORY_LTF_COUNT = 600    # сколько свечей M5 просить при подгрузке истории
+HISTORY_HTF_COUNT = 150    # сколько свечей H1 просить при подгрузке истории
+HISTORY_TIMEOUT_SECONDS = 20
 
-LOOKBACK_CANDLES = 50
-LEVEL_TOLERANCE_PCT = 0.0007
-VOLUME_AVG_WINDOW = 20
-MIN_VOLATILITY_RATIO = 0.4
+MIN_HTF_CANDLES = 30       # меньше — H1 анализ не запускаем
+MIN_LTF_CANDLES = 30       # меньше — M5 анализ не запускаем
 
-COOLDOWN_MINUTES = 10
+SWING_WING = 2                 # свеча-экстремум: выше/ниже 2 соседей с каждой стороны
+HTF_SETUP_LOOKBACK = 24        # в скольких последних свечах H1 ищем FVG
+HTF_LIQ_LOOKBACK = 20          # из скольких предыдущих свечей H1 берём уровень ликвидности
+HTF_SWEEP_MAX_BEFORE_IMPULSE = 6   # снятие не раньше чем за 6 свечей до импульса
+IMPULSE_BODY_FACTOR = 1.3      # тело импульсной свечи >= 1.3 средних тел
+
+LTF_CONFIRM_WINDOW = 24        # подтверждение ищем в последних 24 свечах M5 (2 часа)
+LTF_LIQ_LOOKBACK = 12          # уровень локальной ликвидности — за 12 свечей M5 (1 час)
+LTF_STRUCTURE_LOOKBACK = 6     # локальная структура для слома — 6 свечей M5
+FVG_TOLERANCE_PCT = 0.0002     # допуск к границам FVG (0.02%)
+
+EXPIRATION_MINUTES = 30
+CHECK_HORIZONS = (15, 30, 60)  # через сколько минут проверять цену для статистики
+
+AUTO_ANALYSIS_INTERVAL = 60    # автоанализ раз в минуту
+COOLDOWN_MINUTES = 60          # не чаще 1 сигнала в час по паре+направлению
 
 CIRCUIT_BREAKER_WINDOW = 10
 CIRCUIT_BREAKER_THRESHOLD_PCT = 40
@@ -162,68 +154,21 @@ TIMEZONE = ZoneInfo("Europe/Oslo")
 WORK_START_HOUR = 6
 WORK_END_HOUR = 20
 
-MAX_CANDLES = 80
+STALE_TICKS_SECONDS = 300      # нет котировок дольше 5 мин — считаем, что рынок закрыт
 
 # ---------------------------------------------------------------------------
-# КОНФИГ — EXPRESS-РЕЖИМ (добавлено)
+# СОСТОЯНИЕ
 # ---------------------------------------------------------------------------
 
-# Точные имена enum-полей для акций заранее неизвестны — резолвятся при
-# старте по ключевым словам (см. resolve_express_pool()).
-EXPRESS_ASSET_KEYWORDS = [
-    "MICROSOFT",
-    "PFIZER",
-    "CITIGROUP",
-    "MARATHON",       # Marathon Digital Holdings
-    "NETFLIX",
-    "INTEL",
-    "APPLE",
-    "AMAZON",
-    "BOEING",
-    "COINBASE",
-]
-
-# Снэпшот выплат с твоего скриншота Pocket Option (экспресс-сделки).
-# Стартовое значение, пока не подключён живой поток payout — обнови
-# командой /setpayout, если выплата в приложении поменяется.
-EXPRESS_PAYOUT_SNAPSHOT = {
-    "MICROSOFT": 92,
-    "PFIZER": 92,
-    "CITIGROUP": 92,
-    "MARATHON": 92,
-    "NETFLIX": 90,
-    "INTEL": 87,
-    "APPLE": 83,
-    "AMAZON": 83,
-    "BOEING": 82,
-    "COINBASE": 80,
-}
-
-EXPRESS_ASSET_POOL: list[Asset] = []          # заполняется resolve_express_pool()
-_keyword_to_asset_key: dict[str, str] = {}
-
-EXPRESS_SET_SIZE = 3
-EXPRESS_EXPIRATION_SECONDS = 180               # 3 минуты
-EXPRESS_INTERVAL_SECONDS = 600                 # тик анализа раз в 10 минут
-
-PAYOUT_MIN = 89
-PAYOUT_MAX = 92
-
-# ---------------------------------------------------------------------------
-# ХРАНИЛИЩЕ СВЕЧЕЙ (общее для обоих режимов — уже универсально по asset_key)
-# ---------------------------------------------------------------------------
+ACTIVE_ASSETS: list = []                      # заполняется resolve_pairs()
 
 candle_store: dict[tuple[str, int], deque] = {}
+last_tick: dict[str, tuple[float, float]] = {}   # asset_key -> (unix time, цена)
 _store_lock = asyncio.Lock()
 
-signal_history: list[dict] = []          # сигналы базового режима
+signal_history: list[dict] = []
+used_setups: set[tuple] = set()               # (актив, направление, время FVG)
 _history_lock = asyncio.Lock()
-
-express_set_history: list[dict] = []     # сеты express-режима
-_set_history_lock = asyncio.Lock()
-
-payout_store: dict[str, float] = {}      # ручной снэпшот payout (express)
-_payout_lock = asyncio.Lock()
 
 _notify_bot = None
 _notify_chat_id: int | None = None
@@ -234,116 +179,136 @@ def _asset_key(asset) -> str:
     return asset.value if hasattr(asset, "value") else str(asset)
 
 
-def resolve_express_pool() -> list[str]:
-    """Ищет в Asset enum поля под ключевые слова EXPRESS_ASSET_KEYWORDS
-    (содержит слово + заканчивается на 'otc', без учёта регистра).
-    Заполняет EXPRESS_ASSET_POOL и стартовый payout_store по снэпшоту.
-    Возвращает список ключевых слов, для которых ничего не нашлось."""
-    global EXPRESS_ASSET_POOL, _keyword_to_asset_key
+def _pair_label(asset_key: str) -> str:
+    return asset_key.replace("#", "").replace("_", " ").strip()
 
-    all_names = [n for n in dir(Asset) if not n.startswith("_")]
-    resolved: list[Asset] = []
-    missing: list[str] = []
 
-    for keyword in EXPRESS_ASSET_KEYWORDS:
-        candidates = [
-            n for n in all_names
-            if keyword.upper() in n.upper() and n.upper().endswith("OTC")
-        ]
-        if not candidates:
-            missing.append(keyword)
+def _price_fmt(asset_key: str, price: float) -> str:
+    return f"{price:.3f}" if "JPY" in asset_key.upper() else f"{price:.5f}"
+
+
+def resolve_pairs() -> list[str]:
+    """Находит в Asset enum реальные (не OTC) пары из PAIRS.
+    Возвращает список пар, которые не нашлись."""
+    global ACTIVE_ASSETS
+
+    names = [n for n in dir(Asset) if not n.startswith("_")]
+    real_names = [n for n in names if "OTC" not in n.upper()]
+
+    def _clean(name: str) -> str:
+        return name.upper().replace("#", "").replace("_", "").replace("/", "")
+
+    found = []
+    missing = []
+    for pair in PAIRS:
+        exact = [n for n in real_names if _clean(n) == pair]
+        if not exact:
+            missing.append(pair)
             continue
-        chosen_name = min(candidates, key=len)
-        asset_obj = getattr(Asset, chosen_name)
-        resolved.append(asset_obj)
-        _keyword_to_asset_key[keyword] = _asset_key(asset_obj)
-        print(f"[express] Актив найден: '{keyword}' -> Asset.{chosen_name}")
+        asset_obj = getattr(Asset, exact[0])
+        found.append(asset_obj)
+        print(f"[pairs] Пара найдена: {pair} -> Asset.{exact[0]}")
 
-    EXPRESS_ASSET_POOL = resolved
+    ACTIVE_ASSETS = found
 
-    for keyword, payout in EXPRESS_PAYOUT_SNAPSHOT.items():
-        asset_key = _keyword_to_asset_key.get(keyword)
-        if asset_key:
-            payout_store[asset_key] = float(payout)
+    if missing:
+        print(f"[pairs] Не найдены: {', '.join(missing)}")
+        print(f"[pairs] Все не-OTC активы в библиотеке ({len(real_names)}): {', '.join(sorted(real_names))}")
 
     return missing
 
 
-async def _push_candle(asset_key: str, period: int, price: float, bucket_time: int):
+# ---------------------------------------------------------------------------
+# ХРАНИЛИЩЕ СВЕЧЕЙ
+# ---------------------------------------------------------------------------
+
+def _maxlen(period: int) -> int:
+    return MAX_HTF_CANDLES if period == TF_HTF else MAX_LTF_CANDLES
+
+
+async def _push_tick(asset_key: str, price: float, ts: float):
+    async with _store_lock:
+        last_tick[asset_key] = (ts, price)
+        for period in (TF_LTF, TF_HTF):
+            bucket = int(ts // period * period)
+            key = (asset_key, period)
+            if key not in candle_store:
+                candle_store[key] = deque(maxlen=_maxlen(period))
+            dq = candle_store[key]
+            if dq and dq[-1]["time"] == bucket:
+                c = dq[-1]
+                c["high"] = max(c["high"], price)
+                c["low"] = min(c["low"], price)
+                c["close"] = price
+            elif not dq or dq[-1]["time"] < bucket:
+                dq.append({"time": bucket, "open": price, "high": price, "low": price, "close": price})
+
+
+async def _seed_candles(asset_key: str, period: int, candles: list[dict]):
+    """Вливает историю в хранилище. Живые свечи важнее исторических
+    (они свежее), поэтому при совпадении времени остаётся живая."""
     key = (asset_key, period)
     async with _store_lock:
-        if key not in candle_store:
-            candle_store[key] = deque(maxlen=MAX_CANDLES)
-        dq = candle_store[key]
-        if dq and dq[-1]["time"] == bucket_time:
-            c = dq[-1]
-            c["high"] = max(c["high"], price)
-            c["low"] = min(c["low"], price)
-            c["close"] = price
-            c["volume"] = c.get("volume", 1) + 1
+        merged = {c["time"]: dict(c) for c in candles}
+        for c in candle_store.get(key, []):
+            merged[c["time"]] = c
+        ordered = sorted(merged.values(), key=lambda c: c["time"])[-_maxlen(period):]
+        candle_store[key] = deque(ordered, maxlen=_maxlen(period))
+
+
+async def _build_htf_from_ltf(asset_key: str):
+    """Если H1-история не загрузилась, собираем H1 из свечей M5."""
+    async with _store_lock:
+        ltf = list(candle_store.get((asset_key, TF_LTF), []))
+    if not ltf:
+        return 0
+    buckets: dict[int, dict] = {}
+    for c in ltf:
+        b = c["time"] // TF_HTF * TF_HTF
+        if b not in buckets:
+            buckets[b] = {"time": b, "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"]}
         else:
-            dq.append({
-                "time": bucket_time,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 1,
-            })
+            h = buckets[b]
+            h["high"] = max(h["high"], c["high"])
+            h["low"] = min(h["low"], c["low"])
+            h["close"] = c["close"]
+    await _seed_candles(asset_key, TF_HTF, list(buckets.values()))
+    return len(buckets)
 
 
-async def _seed_candles_from_history(asset_key: str, period: int, raw_candles: list[dict]):
-    key = (asset_key, period)
+async def _get_closed_frame(asset_key: str, period: int) -> pd.DataFrame | None:
+    """Только ЗАКРЫТЫЕ свечи — текущая формирующаяся отбрасывается."""
+    current_bucket = int(time.time() // period * period)
     async with _store_lock:
-        dq = deque(maxlen=MAX_CANDLES)
-        for c in raw_candles[-MAX_CANDLES:]:
-            dq.append({
-                "time": c["time"],
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "volume": 1,
-            })
-        if dq:
-            candle_store[key] = dq
-
-
-async def _get_frame(asset_key: str, period: int) -> pd.DataFrame | None:
-    key = (asset_key, period)
-    async with _store_lock:
-        dq = candle_store.get(key)
-        if not dq or len(dq) < 10:
+        dq = candle_store.get((asset_key, period))
+        if not dq:
             return None
-        return pd.DataFrame(list(dq))
+        rows = [c for c in dq if c["time"] < current_bucket]
+    if not rows:
+        return None
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
+async def _candle_count(asset_key: str, period: int) -> int:
+    async with _store_lock:
+        return len(candle_store.get((asset_key, period), []))
 
 
 async def _get_last_price(asset_key: str) -> float | None:
-    key = (asset_key, TF_M5)
     async with _store_lock:
-        dq = candle_store.get(key)
-        if not dq:
-            return None
-        return dq[-1]["close"]
+        tick = last_tick.get(asset_key)
+    return tick[1] if tick else None
 
 
-async def get_payout(asset_key: str) -> float | None:
-    async with _payout_lock:
-        return payout_store.get(asset_key)
+async def _tick_age(asset_key: str) -> float | None:
+    async with _store_lock:
+        tick = last_tick.get(asset_key)
+    return time.time() - tick[0] if tick else None
 
 
-async def set_payout(asset_key: str, payout: float):
-    async with _payout_lock:
-        payout_store[asset_key] = payout
-
-
-def _format_timedelta(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    minutes, sec = divmod(seconds, 60)
-    if minutes:
-        return f"{minutes} мин {sec} сек"
-    return f"{sec} сек"
-
+# ---------------------------------------------------------------------------
+# ОБЩЕЕ
+# ---------------------------------------------------------------------------
 
 def is_within_working_hours() -> bool:
     now_local = datetime.now(TIMEZONE)
@@ -360,167 +325,257 @@ async def _notify(text: str):
 
 
 # ---------------------------------------------------------------------------
-# АНАЛИЗ: ОБЩИЙ ДВИЖОК (используется обоими режимами, без изменений)
+# SMC-АНАЛИЗ
+# Вся логика написана для ПОКУПКИ. Для продажи график зеркалится
+# (цены * -1, high <-> low) — тогда нисходящий тренд становится
+# восходящим и работают те же правила. Результат зеркалится обратно.
 # ---------------------------------------------------------------------------
 
-def is_market_alive(frame: pd.DataFrame) -> bool:
-    recent = frame.tail(LOOKBACK_CANDLES)
-    if len(recent) < 10:
-        return True
-    ranges = recent["high"] - recent["low"]
-    avg_range = ranges.iloc[:-1].mean()
-    last_range = ranges.iloc[-1]
-    if avg_range <= 0:
-        return True
-    return (last_range / avg_range) >= MIN_VOLATILITY_RATIO
+def _mirror(df: pd.DataFrame) -> pd.DataFrame:
+    m = df.copy()
+    m["open"] = -df["open"]
+    m["close"] = -df["close"]
+    m["high"] = -df["low"]
+    m["low"] = -df["high"]
+    return m
 
 
-def find_levels(frame: pd.DataFrame) -> list[dict]:
-    recent = frame.tail(LOOKBACK_CANDLES).reset_index(drop=True)
-    if len(recent) < 10:
-        return []
-
-    swing_highs = []
-    swing_lows = []
-    for i in range(2, len(recent) - 2):
-        window = recent.iloc[i - 2:i + 3]
-        if recent["high"][i] == window["high"].max():
-            swing_highs.append(recent["high"][i])
-        if recent["low"][i] == window["low"].min():
-            swing_lows.append(recent["low"][i])
-
-    def cluster(points: list[float], kind: str) -> list[dict]:
-        levels = []
-        for p in points:
-            matched = False
-            for lvl in levels:
-                if abs(p - lvl["price"]) / lvl["price"] <= LEVEL_TOLERANCE_PCT:
-                    lvl["touches"] += 1
-                    lvl["price"] = (lvl["price"] * (lvl["touches"] - 1) + p) / lvl["touches"]
-                    matched = True
-                    break
-            if not matched:
-                levels.append({"price": p, "touches": 1, "type": kind})
-        return levels
-
-    return cluster(swing_highs, "high") + cluster(swing_lows, "low")
+def swing_points(df: pd.DataFrame, wing: int = SWING_WING) -> tuple[list[int], list[int]]:
+    highs, lows = [], []
+    h = df["high"].values
+    lo = df["low"].values
+    for i in range(wing, len(df) - wing):
+        if h[i] == h[i - wing:i + wing + 1].max():
+            highs.append(i)
+        if lo[i] == lo[i - wing:i + wing + 1].min():
+            lows.append(i)
+    return highs, lows
 
 
-def level_score(touches: int) -> int:
-    if touches <= 1:
-        return 0
-    if touches == 2:
-        return 14
-    if touches == 3:
-        return 26
-    if touches == 4:
-        return 30
-    if touches == 5:
-        return 20
-    return 12
+def htf_trend(df: pd.DataFrame) -> tuple[str, str]:
+    """Возвращает (направление, основание): направление UP / DOWN / FLAT,
+    основание "structure" (HH+HL / LH+LL) или "ema" (запасной вариант)."""
+    highs, lows = swing_points(df)
+    if len(highs) >= 2 and len(lows) >= 2:
+        h_prev, h_last = df["high"].iloc[highs[-2]], df["high"].iloc[highs[-1]]
+        l_prev, l_last = df["low"].iloc[lows[-2]], df["low"].iloc[lows[-1]]
+        if h_last > h_prev and l_last > l_prev:
+            return "UP", "structure"
+        if h_last < h_prev and l_last < l_prev:
+            return "DOWN", "structure"
+
+    closes = df["close"]
+    if len(closes) >= 20:
+        ema_fast = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+        ema_slow = closes.ewm(span=50, adjust=False).mean().iloc[-1]
+        last = closes.iloc[-1]
+        if last > ema_fast > ema_slow:
+            return "UP", "ema"
+        if last < ema_fast < ema_slow:
+            return "DOWN", "ema"
+    return "FLAT", ""
 
 
-def classify_candle_pattern(last: pd.Series, prev: pd.Series) -> tuple[str, int, str]:
-    body = abs(last["close"] - last["open"])
-    full_range = last["high"] - last["low"]
-    if full_range <= 0:
-        return "нет паттерна", 0, "NONE"
-
-    upper_wick = last["high"] - max(last["close"], last["open"])
-    lower_wick = min(last["close"], last["open"]) - last["low"]
-
-    if lower_wick >= body * 2 and lower_wick > upper_wick and body / full_range < 0.35:
-        return "пин-бар (бычий)", 30, "UP"
-    if upper_wick >= body * 2 and upper_wick > lower_wick and body / full_range < 0.35:
-        return "пин-бар (медвежий)", 30, "DOWN"
-
-    prev_body = abs(prev["close"] - prev["open"])
-    if (
-        last["close"] > last["open"]
-        and prev["close"] < prev["open"]
-        and last["close"] >= prev["open"]
-        and last["open"] <= prev["close"]
-        and body > prev_body
-    ):
-        return "бычье поглощение", 28, "UP"
-    if (
-        last["close"] < last["open"]
-        and prev["close"] > prev["open"]
-        and last["open"] >= prev["close"]
-        and last["close"] <= prev["open"]
-        and body > prev_body
-    ):
-        return "медвежье поглощение", 28, "DOWN"
-
-    if body / full_range < 0.1:
-        return "доджи", 12, "NONE"
-
-    return "нет паттерна", 0, "NONE"
-
-
-def volume_score(frame: pd.DataFrame) -> tuple[int, str]:
-    if "volume" not in frame.columns or len(frame) < VOLUME_AVG_WINDOW + 1:
-        return 0, "активность: недостаточно данных"
-
-    recent = frame.tail(VOLUME_AVG_WINDOW + 1)
-    avg_ticks = recent["volume"].iloc[:-1].mean()
-    last_ticks = recent["volume"].iloc[-1]
-
-    if avg_ticks <= 0:
-        return 0, "активность: недостаточно данных"
-
-    ratio = last_ticks / avg_ticks
-    if ratio >= 2.0:
-        return 25, f"активность x{ratio:.1f} от средней ({int(last_ticks)} тиков)"
-    if ratio >= 1.5:
-        return 18, f"активность x{ratio:.1f} от средней ({int(last_ticks)} тиков)"
-    if ratio >= 1.2:
-        return 10, f"активность x{ratio:.1f} от средней ({int(last_ticks)} тиков)"
-    return 0, f"активность в норме (x{ratio:.1f})"
-
-
-def trend_bonus(frame_m15: pd.DataFrame | None, direction: str) -> tuple[int, str]:
-    if frame_m15 is None or len(frame_m15) < 10:
-        return 0, "тренд M15: недостаточно данных"
-
-    closes = frame_m15["close"]
-    ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
-    ema50 = closes.ewm(span=min(50, len(closes)), adjust=False).mean().iloc[-1]
-    last_close = closes.iloc[-1]
-
-    if last_close > ema20 > ema50:
-        m15_trend = "UP"
-    elif last_close < ema20 < ema50:
-        m15_trend = "DOWN"
-    else:
-        m15_trend = "FLAT"
-
-    if m15_trend == "FLAT":
-        return 0, "тренд M15: боковик"
-    if m15_trend == direction:
-        return 15, f"тренд M15: {m15_trend} — совпадает ✅"
-    return 0, f"тренд M15: {m15_trend} — против сигнала ⚠️"
-
-
-def approach_bonus(frame: pd.DataFrame, direction: str) -> tuple[int, str]:
-    if len(frame) < 6:
-        return 0, "подход: недостаточно данных"
-
-    window = frame.iloc[-5:-2]
-    if len(window) < 3:
-        return 0, "подход: недостаточно данных"
-
+def trend_label(direction: str, basis: str) -> str:
     if direction == "UP":
-        directional = (window["close"] < window["open"]).sum()
+        return "восходящий (HH + HL)" if basis == "structure" else "восходящий (EMA20 > EMA50)"
+    return "нисходящий (LH + LL)" if basis == "structure" else "нисходящий (EMA20 < EMA50)"
+
+
+def find_bullish_htf_setup(df: pd.DataFrame) -> dict | None:
+    """H1: снятие ликвидности -> импульс -> FVG, который ещё не сломан.
+    Возвращает самый свежий подходящий сетап."""
+    n = len(df)
+    if n < HTF_LIQ_LOOKBACK + 5:
+        return None
+
+    op = df["open"].values
+    cl = df["close"].values
+    hi = df["high"].values
+    lo = df["low"].values
+    avg_body = (df["close"] - df["open"]).abs().tail(50).mean()
+    if avg_body <= 0:
+        return None
+
+    start = max(HTF_LIQ_LOOKBACK + 2, n - HTF_SETUP_LOOKBACK)
+    for i in range(n - 1, start - 1, -1):
+        # FVG: минимум 3-й свечи выше максимума 1-й
+        if lo[i] <= hi[i - 2]:
+            continue
+        imp = i - 1
+        if cl[imp] <= op[imp] or (cl[imp] - op[imp]) < IMPULSE_BODY_FACTOR * avg_body:
+            continue
+
+        fvg_bottom, fvg_top = hi[i - 2], lo[i]
+
+        # FVG сломан, если после него была свеча, закрывшаяся ниже нижней границы
+        if i + 1 < n and (cl[i + 1:] < fvg_bottom).any():
+            continue
+
+        # Снятие ликвидности перед импульсом
+        sweep = None
+        lower = max(imp - HTF_SWEEP_MAX_BEFORE_IMPULSE, HTF_LIQ_LOOKBACK)
+        for j in range(imp, lower - 1, -1):
+            level = lo[j - HTF_LIQ_LOOKBACK:j].min()
+            if lo[j] < level:
+                sweep = (j, level)
+                break
+        if sweep is None:
+            continue
+
+        j, level = sweep
+        return {
+            "sweep_index": j,
+            "fvg_time": int(df["time"].iloc[i]),
+            "fvg_bottom": float(fvg_bottom),
+            "fvg_top": float(fvg_top),
+            "sweep_level": float(level),
+            "sweep_extreme": float(lo[j]),
+            "target": float(hi[imp:].max()),   # ближайшая «проблемная зона» — хай импульса
+        }
+    return None
+
+
+def find_bullish_ltf_confirmation(df: pd.DataFrame, fvg_bottom: float, fvg_top: float) -> dict | None:
+    """M5: снятие локальной ликвидности в зоне FVG и слом структуры
+    на ПОСЛЕДНЕЙ закрытой свече (чтобы сигнал был в момент входа)."""
+    n = len(df)
+    if n < LTF_LIQ_LOOKBACK + 5:
+        return None
+
+    cl = df["close"].values
+    hi = df["high"].values
+    lo = df["low"].values
+    tol = abs(fvg_top) * FVG_TOLERANCE_PCT
+    b = n - 1  # свеча слома — последняя закрытая
+
+    start = max(LTF_LIQ_LOOKBACK, n - LTF_CONFIRM_WINDOW)
+    for s in range(b - 1, start - 1, -1):
+        level = lo[s - LTF_LIQ_LOOKBACK:s].min()
+        if lo[s] >= level:
+            continue                               # локальная ликвидность не снята
+        if lo[s] > fvg_top + tol:
+            continue                               # снятие не в зоне FVG — цена не вернулась
+        if cl[s] < fvg_bottom - tol:
+            continue                               # закрылись под FVG — зона не удержала
+
+        struct_high = hi[max(0, s - LTF_STRUCTURE_LOOKBACK):s + 1].max()
+        broke_now = cl[b] > struct_high
+        broke_earlier = s + 1 < b and (cl[s + 1:b] > struct_high).any()
+        if broke_now and not broke_earlier:
+            return {
+                "sweep_extreme": float(lo[s]),
+                "bos_level": float(struct_high),
+                "entry": float(cl[b]),
+                "stop": float(lo[s]),
+            }
+    return None
+
+
+async def analyze_pair(asset) -> tuple[dict | None, str]:
+    """Возвращает (сигнал или None, короткое объяснение для /signal)."""
+    asset_key = _asset_key(asset)
+
+    htf = await _get_closed_frame(asset_key, TF_HTF)
+    ltf = await _get_closed_frame(asset_key, TF_LTF)
+    htf_n = 0 if htf is None else len(htf)
+    ltf_n = 0 if ltf is None else len(ltf)
+    if htf_n < MIN_HTF_CANDLES:
+        return None, f"мало свечей H1 ({htf_n}/{MIN_HTF_CANDLES})"
+    if ltf_n < MIN_LTF_CANDLES:
+        return None, f"мало свечей M5 ({ltf_n}/{MIN_LTF_CANDLES})"
+
+    age = await _tick_age(asset_key)
+    if age is None or age > STALE_TICKS_SECONDS:
+        return None, "нет свежих котировок (рынок закрыт?)"
+
+    # Проверяем обе стороны: покупку на исходном графике, продажу — на зеркальном.
+    # Тренд оцениваем по структуре ДО снятия ликвидности: само снятие делает
+    # новый минимум (максимум), и если смотреть после него, тренд «ломается».
+    candidates = []
+    reasons = []
+    for direction, sign in (("UP", 1), ("DOWN", -1)):
+        h = htf if sign == 1 else _mirror(htf)
+        setup = find_bullish_htf_setup(h)
+        if setup is None:
+            continue
+        trend_dir, basis = htf_trend(h.iloc[:setup["sweep_index"]])
+        if trend_dir != "UP":      # в зеркале "UP" = нисходящий тренд оригинала
+            reasons.append(f"FVG {'вверх' if sign == 1 else 'вниз'} есть, но против тренда H1")
+            continue
+        candidates.append((setup["fvg_time"], direction, sign, setup, trend_label(direction, basis)))
+
+    if not candidates:
+        return None, reasons[0] if reasons else "H1: нет снятия ликвидности + FVG по тренду"
+
+    candidates.sort(key=lambda c: c[0], reverse=True)   # самый свежий FVG первым
+    signal = None
+    reason = ""
+    for _, direction, sign, setup, t_label in candidates:
+        setup_id = (asset_key, direction, setup["fvg_time"])
+        if setup_id in used_setups:
+            reason = reason or "по этому FVG сигнал уже был"
+            continue
+        lt = ltf if sign == 1 else _mirror(ltf)
+        conf = find_bullish_ltf_confirmation(lt, setup["fvg_bottom"], setup["fvg_top"])
+        if conf is None:
+            reason = reason or f"H1 {t_label}, FVG есть — ждём возврата и слома структуры на M5"
+            continue
+        if await is_on_cooldown(asset_key, direction):
+            reason = reason or "cooldown по паре"
+            continue
+        signal = (direction, sign, setup, conf, t_label, setup_id)
+        break
+
+    if signal is None:
+        return None, reason
+
+    direction, sign, setup, conf, t_label, setup_id = signal
+    # зеркалим значения обратно для продажи
+    fvg_a, fvg_b = setup["fvg_bottom"] * sign, setup["fvg_top"] * sign
+    signal = {
+        "asset": asset_key,
+        "direction": direction,
+        "setup_id": setup_id,
+        "trend_label": t_label,
+        "entry": conf["entry"] * sign,
+        "fvg_low": min(fvg_a, fvg_b),
+        "fvg_high": max(fvg_a, fvg_b),
+        "htf_sweep_level": setup["sweep_level"] * sign,
+        "ltf_sweep": conf["sweep_extreme"] * sign,
+        "bos_level": conf["bos_level"] * sign,
+        "stop": conf["stop"] * sign,
+        "target": setup["target"] * sign,
+    }
+    return signal, "✅ сигнал"
+
+
+def format_signal(s: dict) -> str:
+    k = s["asset"]
+    p = lambda v: _price_fmt(k, v)  # noqa: E731
+    if s["direction"] == "UP":
+        head = "ВВЕРХ (CALL) 🟢"
+        sweep_word, bos_word = "минимума", "локального максимума"
     else:
-        directional = (window["close"] > window["open"]).sum()
+        head = "ВНИЗ (PUT) 🔴"
+        sweep_word, bos_word = "максимума", "локального минимума"
+    return (
+        f"🧠 SMC-СИГНАЛ — {_pair_label(k)}\n"
+        f"Направление: {head}\n"
+        f"Вход: СЕЙЧАС, цена {p(s['entry'])}\n"
+        f"Экспирация: {EXPIRATION_MINUTES} мин\n\n"
+        f"H1 тренд: {s['trend_label']}\n"
+        f"H1 снятие ликвидности: {sweep_word} {p(s['htf_sweep_level'])}\n"
+        f"H1 FVG (имбаланс): {p(s['fvg_low'])} – {p(s['fvg_high'])}\n"
+        f"M5: снятие локальной ликвидности ({p(s['ltf_sweep'])}) и слом {bos_word} {p(s['bos_level'])}\n\n"
+        f"Ориентир стопа: {p(s['stop'])}\n"
+        f"Ближайшая цель (проблемная зона): {p(s['target'])}"
+    )
 
-    if directional >= 3:
-        return 10, "подход: чёткое направленное движение ✅"
-    if directional == 2:
-        return 5, "подход: частично направленное"
-    return 0, "подход: случайный заход"
 
+# ---------------------------------------------------------------------------
+# СТАТИСТИКА (проверка через 15 / 30 / 60 мин) + CIRCUIT BREAKER
+# ---------------------------------------------------------------------------
 
 async def is_on_cooldown(asset_key: str, direction: str) -> bool:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=COOLDOWN_MINUTES)
@@ -533,266 +588,98 @@ async def is_on_cooldown(asset_key: str, direction: str) -> bool:
     return False
 
 
-async def analyze_market(asset: Asset) -> dict | None:
-    asset_key = _asset_key(asset)
-    frame = await _get_frame(asset_key, TF_M5)
-    if frame is None or len(frame) < LOOKBACK_CANDLES // 2:
-        return None
-
-    if not is_market_alive(frame):
-        return None
-
-    levels = find_levels(frame)
-    if not levels:
-        return None
-
-    last = frame.iloc[-2]
-    prev = frame.iloc[-3]
-
-    pattern_name, pattern_score, pattern_direction = classify_candle_pattern(last, prev)
-    if pattern_direction == "NONE" or pattern_score == 0:
-        return None
-
-    price = last["close"]
-    nearby_levels = [
-        lvl for lvl in levels
-        if abs(lvl["price"] - price) / price <= LEVEL_TOLERANCE_PCT * 3
-    ]
-    if not nearby_levels:
-        return None
-    strongest = max(nearby_levels, key=lambda lvl: lvl["touches"])
-
-    lvl_score = level_score(strongest["touches"])
-    if lvl_score == 0:
-        return None
-
-    vol_score, vol_label = volume_score(frame)
-
-    frame_m15 = await _get_frame(asset_key, TF_M15)
-    tr_score, tr_label = trend_bonus(frame_m15, pattern_direction)
-
-    ap_score, ap_label = approach_bonus(frame, pattern_direction)
-
-    raw_total = lvl_score + pattern_score + vol_score + tr_score + ap_score
-    confidence_pct = round(raw_total / SCORE_MAX * 100)
-
-    if confidence_pct < CONFIDENCE_THRESHOLD:
-        return None
-
-    if await is_on_cooldown(asset_key, pattern_direction):
-        return None
-
-    return {
-        "asset": asset_key,
-        "direction": pattern_direction,
-        "confidence": confidence_pct,
-        "pattern": pattern_name,
-        "level_touches": strongest["touches"],
-        "level_price": strongest["price"],
-        "volume_label": vol_label,
-        "trend_label": tr_label,
-        "approach_label": ap_label,
-        "price": price,
-    }
-
-
-async def analyze_many(assets: list[Asset]) -> list[dict]:
-    results = []
-    for a in assets:
-        signal = await analyze_market(a)
-        if signal:
-            results.append(signal)
-    return results
-
-
-def format_signal(signal: dict) -> str:
-    direction_ru = "ВВЕРХ (CALL) 🟢" if signal["direction"] == "UP" else "ВНИЗ (PUT) 🔴"
-    label = signal["asset"].replace("_otc", " OTC")
-    prefix = "🔥 СИЛЬНЫЙ СИГНАЛ" if signal["confidence"] >= STRONG_SIGNAL_THRESHOLD else "🔔 СИГНАЛ"
-    return (
-        f"{prefix} — {label}\n"
-        f"Направление: {direction_ru}\n"
-        f"Уверенность: {signal['confidence']}%\n"
-        f"Экспирация: {EXPIRATION_SECONDS // 60} мин\n\n"
-        f"Паттерн: {signal['pattern']}\n"
-        f"Уровень: {signal['level_price']:.5f} (касаний: {signal['level_touches']})\n"
-        f"{signal['volume_label']}\n"
-        f"{signal['trend_label']}\n"
-        f"{signal['approach_label']}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# EXPRESS-ЛОГИКА (добавлено)
-# ---------------------------------------------------------------------------
-
-async def analyze_express_pool() -> list[dict]:
-    candidates = []
-    for asset in EXPRESS_ASSET_POOL:
-        asset_key = _asset_key(asset)
-
-        payout = await get_payout(asset_key)
-        if payout is None:
-            continue
-        if not (PAYOUT_MIN <= payout <= PAYOUT_MAX):
-            continue
-
-        signal = await analyze_market(asset)
-        if signal:
-            signal["payout"] = payout
-            candidates.append(signal)
-
-    if len(candidates) < EXPRESS_SET_SIZE:
-        return []
-
-    candidates.sort(key=lambda s: s["confidence"], reverse=True)
-    return candidates[:EXPRESS_SET_SIZE]
-
-
-def format_express_set(signal_set: list[dict], set_id: int) -> str:
-    lines = [
-        f"🎯 EXPRESS-СЕТ #{set_id}",
-        f"Экспирация: {EXPRESS_EXPIRATION_SECONDS // 60} мин | активов: {len(signal_set)}",
-        "",
-    ]
-    for s in signal_set:
-        direction_ru = "ВВЕРХ (CALL) 🟢" if s["direction"] == "UP" else "ВНИЗ (PUT) 🔴"
-        label = s["asset"].replace("_otc", " OTC")
-        lines.append(
-            f"• {label} — {direction_ru}\n"
-            f"  Уверенность: {s['confidence']}% | Выплата: {s['payout']:.0f}%\n"
-            f"  Паттерн: {s['pattern']} | {s['trend_label']}"
-        )
-    avg_conf = round(sum(s["confidence"] for s in signal_set) / len(signal_set))
-    lines.append(f"\nСредняя уверенность по сету: {avg_conf}%")
-    return "\n".join(lines)
-
-
-async def record_express_set(signal_set: list[dict]) -> int:
-    async with _set_history_lock:
-        set_id = len(express_set_history) + 1
-        express_set_history.append({
-            "id": set_id,
-            "time": datetime.now(timezone.utc),
-            "assets": [
-                {"asset": s["asset"], "direction": s["direction"], "price_at_signal": s["price"]}
-                for s in signal_set
-            ],
-            "checked": False,
-            "all_correct": None,
-        })
-    return set_id
-
-
-async def check_express_outcomes():
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=EXPRESS_EXPIRATION_SECONDS)
-    async with _set_history_lock:
-        pending_sets = [s for s in express_set_history if not s["checked"] and s["time"] <= cutoff]
-
-    for signal_set in pending_sets:
-        results = []
-        incomplete = False
-        for item in signal_set["assets"]:
-            current_price = await _get_last_price(item["asset"])
-            if current_price is None:
-                incomplete = True
-                break
-            went_up = current_price > item["price_at_signal"]
-            correct = went_up if item["direction"] == "UP" else not went_up
-            results.append(correct)
-        if incomplete:
-            continue
-        async with _set_history_lock:
-            signal_set["checked"] = True
-            signal_set["all_correct"] = all(results)
-        if signal_set["all_correct"]:
-            await _notify(f"✅ Express-сет #{signal_set['id']} зашёл полностью (все {len(results)} актива).")
-        else:
-            hit = sum(results)
-            await _notify(f"❌ Express-сет #{signal_set['id']} не зашёл ({hit}/{len(results)} угадано).")
-
-
-def express_stats_summary() -> str:
-    checked_sets = [s for s in express_set_history if s["checked"]]
-    if not checked_sets:
-        return "Пока нет завершённых express-сетов."
-    total_sets = len(checked_sets)
-    full_hits = sum(1 for s in checked_sets if s["all_correct"])
-    set_winrate = round(full_hits / total_sets * 100)
-    return f"Express-сеты (все 3 зашли): {full_hits}/{total_sets} ({set_winrate}%)"
-
-
-# ---------------------------------------------------------------------------
-# СТАТИСТИКА + CIRCUIT BREAKER — БАЗОВЫЙ РЕЖИМ (без изменений)
-# ---------------------------------------------------------------------------
-
-async def record_signal(asset_key: str, direction: str, price: float, confidence: int):
+async def record_signal(signal: dict):
     async with _history_lock:
+        used_setups.add(signal["setup_id"])
         signal_history.append({
+            "id": len(signal_history) + 1,
             "time": datetime.now(timezone.utc),
-            "asset": asset_key,
-            "direction": direction,
-            "price_at_signal": price,
-            "confidence": confidence,
-            "checked": False,
-            "correct": None,
+            "asset": signal["asset"],
+            "direction": signal["direction"],
+            "entry": signal["entry"],
+            "results": {h: None for h in CHECK_HORIZONS},
         })
+
+
+def _judge(direction: str, entry: float, price: float) -> str:
+    if price == entry:
+        return "draw"
+    went_up = price > entry
+    return "win" if went_up == (direction == "UP") else "loss"
 
 
 async def check_pending_outcomes():
-    """Сверяет исходы базового режима (5 мин) и express-сетов (3 мин, своя
-    экспирация — см. check_express_outcomes)."""
     global _circuit_breaker_active
+    now = datetime.now(timezone.utc)
+    expiry_results_changed = False
 
-    await check_express_outcomes()
-
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=EXPIRATION_SECONDS)
     async with _history_lock:
-        pending = [e for e in signal_history if not e["checked"] and e["time"] <= cutoff]
+        entries = list(signal_history)
 
-    for entry in pending:
-        current_price = await _get_last_price(entry["asset"])
-        if current_price is None:
-            continue
-        went_up = current_price > entry["price_at_signal"]
-        correct = went_up if entry["direction"] == "UP" else not went_up
-        async with _history_lock:
-            entry["checked"] = True
-            entry["correct"] = correct
+    for entry in entries:
+        for horizon in CHECK_HORIZONS:
+            if entry["results"][horizon] is not None:
+                continue
+            if now < entry["time"] + timedelta(minutes=horizon):
+                continue
+            price = await _get_last_price(entry["asset"])
+            if price is None:
+                continue
+            result = _judge(entry["direction"], entry["entry"], price)
+            async with _history_lock:
+                entry["results"][horizon] = (result, price)
+            if horizon == EXPIRATION_MINUTES:
+                expiry_results_changed = True
+                icon = {"win": "✅", "loss": "❌", "draw": "➖"}[result]
+                word = {"win": "зашёл", "loss": "не зашёл", "draw": "ничья"}[result]
+                await _notify(
+                    f"{icon} Сигнал #{entry['id']} {_pair_label(entry['asset'])} {word} "
+                    f"(через {horizon} мин: {_price_fmt(entry['asset'], entry['entry'])} → "
+                    f"{_price_fmt(entry['asset'], price)})"
+                )
 
-    if not pending:
+    if not expiry_results_changed:
         return
 
     async with _history_lock:
-        checked = [e for e in signal_history if e["checked"]]
-    last_n = checked[-CIRCUIT_BREAKER_WINDOW:]
+        done = [
+            e["results"][EXPIRATION_MINUTES][0] for e in signal_history
+            if e["results"][EXPIRATION_MINUTES] is not None
+            and e["results"][EXPIRATION_MINUTES][0] != "draw"
+        ]
+    last_n = done[-CIRCUIT_BREAKER_WINDOW:]
     if len(last_n) < CIRCUIT_BREAKER_WINDOW:
         return
-
-    winrate = sum(1 for e in last_n if e["correct"]) / len(last_n) * 100
+    winrate = sum(1 for r in last_n if r == "win") / len(last_n) * 100
 
     if winrate < CIRCUIT_BREAKER_THRESHOLD_PCT and not _circuit_breaker_active:
         _circuit_breaker_active = True
         await _notify(
-            f"⚠️ Последние {CIRCUIT_BREAKER_WINDOW} сигналов угаданы только на "
-            f"{winrate:.0f}% — возможно, стоит пересмотреть пороги или переждать рынок."
+            f"⚠️ Последние {CIRCUIT_BREAKER_WINDOW} сигналов зашли только на {winrate:.0f}% — "
+            "стоит пересмотреть параметры или переждать рынок."
         )
     elif winrate >= CIRCUIT_BREAKER_THRESHOLD_PCT and _circuit_breaker_active:
         _circuit_breaker_active = False
-        await _notify(f"✅ Точность сигналов восстановилась ({winrate:.0f}% из последних {CIRCUIT_BREAKER_WINDOW}).")
+        await _notify(f"✅ Точность восстановилась ({winrate:.0f}% из последних {CIRCUIT_BREAKER_WINDOW}).")
 
 
 def stats_summary() -> str:
-    checked = [e for e in signal_history if e["checked"]]
-    if not checked:
-        base_line = "Базовый режим: пока нет завершённых сигналов."
-    else:
-        total = len(checked)
-        correct = sum(1 for e in checked if e["correct"])
-        winrate = round(correct / total * 100)
-        base_line = f"Базовый режим: {correct}/{total} ({winrate}%)"
-
-    return base_line + "\n" + express_stats_summary()
+    if not signal_history:
+        return "Пока не было ни одного сигнала."
+    lines = [f"Всего сигналов: {len(signal_history)}"]
+    for horizon in CHECK_HORIZONS:
+        results = [e["results"][horizon][0] for e in signal_history if e["results"][horizon] is not None]
+        decisive = [r for r in results if r != "draw"]
+        mark = " (экспирация)" if horizon == EXPIRATION_MINUTES else ""
+        if not decisive:
+            txt = f"только ничьи ({len(results)})" if results else "пока нет данных"
+            lines.append(f"Через {horizon} мин{mark}: {txt}")
+            continue
+        wins = sum(1 for r in decisive if r == "win")
+        draws = len(results) - len(decisive)
+        draw_txt = f", ничьих: {draws}" if draws else ""
+        lines.append(f"Через {horizon} мин{mark}: {wins}/{len(decisive)} ({round(wins / len(decisive) * 100)}%){draw_txt}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -803,34 +690,159 @@ po_client: PocketOptionClient | None = None
 po_connected = False
 _was_ever_connected = False
 
+_HISTORY_PARAM_ALIASES = {
+    "asset": ("asset", "symbol", "active", "asset_name", "pair", "instrument"),
+    "period": ("period", "timeframe", "tf", "interval", "candle_period"),
+    "time": ("time", "end_time", "timestamp", "to", "end", "end_ts"),
+    "offset": ("offset", "count", "limit", "amount"),
+}
+_history_api_logged = False
 
-async def _try_preload_history(assets_to_preload: list[Asset]):
-    for asset in assets_to_preload:
+
+def _log_history_api(func):
+    """Один раз пишет в логи, как устроена функция истории в библиотеке —
+    если подгрузка не заработает, по этим строкам сразу видно, что ей нужно."""
+    try:
+        print(f"[history] Сигнатура: {inspect.signature(func)}")
+    except Exception as error:
+        print(f"[history] Сигнатура недоступна: {error}")
+    try:
+        unwrapped = inspect.unwrap(func)
+        print(f"[history] Сигнатура без обёрток: {inspect.signature(unwrapped)}")
+        source = inspect.getsource(unwrapped).splitlines()[:40]
+        print("[history] Исходник load_history_period:")
+        for line in source:
+            print(f"[history] | {line}")
+    except Exception as error:
+        print(f"[history] Исходник недоступен: {error}")
+
+
+async def _call_load_history(asset, period: int, count: int):
+    global _history_api_logged
+
+    func = po_client.emit.load_history_period
+    if not _history_api_logged:
+        _history_api_logged = True
+        _log_history_api(func)
+
+    now = int(time.time())
+    offset = count * period
+    values = {"asset": asset, "period": period, "time": now, "offset": offset}
+
+    try:
+        params = [
+            p for p in inspect.signature(inspect.unwrap(func)).parameters.values()
+            if p.name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+        ]
+    except (TypeError, ValueError):
+        params = []
+
+    kwargs = {}
+    asset_param = None
+    for logical, aliases in _HISTORY_PARAM_ALIASES.items():
+        for p in params:
+            if p.name in aliases:
+                value = values[logical]
+                if logical == "offset" and p.name != "offset":
+                    value = count          # count/limit — число свечей, а не секунды
+                kwargs[p.name] = value
+                if logical == "asset":
+                    asset_param = p.name
+                break
+
+    attempts = []
+    if kwargs:
+        attempts.append(((), dict(kwargs)))
+        if asset_param:
+            attempts.append(((), {**kwargs, asset_param: _asset_key(asset)}))
+    attempts.append(((asset, period, now, offset), {}))
+    attempts.append(((_asset_key(asset), period, now, offset), {}))
+
+    last_error = None
+    for args, kw in attempts:
+        try:
+            return await asyncio.wait_for(func(*args, **kw), timeout=HISTORY_TIMEOUT_SECONDS)
+        except TypeError as error:
+            last_error = error
+            continue
+    raise last_error or RuntimeError("не удалось вызвать load_history_period")
+
+
+def _to_unix(value) -> int:
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    value = float(value)
+    if value > 1e12:
+        value /= 1000
+    return int(value)
+
+
+def _parse_history(result, period: int) -> list[dict]:
+    """Понимает разные форматы ответа: объекты/словари свечей,
+    списки [time, open, close, high, low] и просто тики [time, price]."""
+    raw = result
+    for attr in ("candles", "data", "history"):
+        value = result.get(attr) if isinstance(result, dict) else getattr(result, attr, None)
+        if value:
+            raw = value
+            break
+    if not isinstance(raw, (list, tuple)):
+        return []
+
+    candles: dict[int, dict] = {}
+
+    def _add(t, o, h, lo, c):
+        bucket = _to_unix(t) // period * period
+        if bucket not in candles:
+            candles[bucket] = {"time": bucket, "open": o, "high": h, "low": lo, "close": c}
+        else:
+            cc = candles[bucket]
+            cc["high"] = max(cc["high"], h)
+            cc["low"] = min(cc["low"], lo)
+            cc["close"] = c
+
+    for item in raw:
+        try:
+            if isinstance(item, dict) or hasattr(item, "open"):
+                get = (lambda k: item[k]) if isinstance(item, dict) else (lambda k: getattr(item, k))
+                t = get("time")
+                o, h, lo, c = (float(get(k)) for k in ("open", "high", "low", "close"))
+            elif isinstance(item, (list, tuple)) and len(item) >= 5:
+                t = item[0]
+                o, c, h, lo = (float(x) for x in item[1:5])
+                if h < max(o, c) or lo > min(o, c):          # другой порядок: t, o, h, l, c
+                    o, h, lo, c = (float(x) for x in item[1:5])
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                t = item[0]
+                o = h = lo = c = float(item[1])              # тик — копим в свечу
+            else:
+                continue
+            _add(t, o, h, lo, c)
+        except Exception:
+            continue
+
+    return sorted(candles.values(), key=lambda c: c["time"])
+
+
+async def _try_preload_history(assets: list):
+    for asset in assets:
         asset_key = _asset_key(asset)
-        for period in (TF_M5, TF_M15):
+        for period, count in ((TF_LTF, HISTORY_LTF_COUNT), (TF_HTF, HISTORY_HTF_COUNT)):
             try:
-                now = int(time.time())
-                result = await po_client.emit.load_history_period(
-                    asset=asset,
-                    period=period,
-                    time=now,
-                    offset=0,
-                )
-                raw = getattr(result, "candles", None) or getattr(result, "data", None) or result
-                parsed = []
-                for c in raw:
-                    parsed.append({
-                        "time": int(getattr(c, "time", None) or c["time"]),
-                        "open": float(getattr(c, "open", None) or c["open"]),
-                        "high": float(getattr(c, "high", None) or c["high"]),
-                        "low": float(getattr(c, "low", None) or c["low"]),
-                        "close": float(getattr(c, "close", None) or c["close"]),
-                    })
+                result = await _call_load_history(asset, period, count)
+                parsed = _parse_history(result, period)
                 if parsed:
-                    await _seed_candles_from_history(asset_key, period, parsed)
-                    print(f"История подгружена: {asset_key} период {period}с, свечей: {len(parsed)}")
+                    await _seed_candles(asset_key, period, parsed)
+                    print(f"[history] Подгружено: {asset_key} {period // 60}м — свечей {len(parsed)}")
+                else:
+                    print(f"[history] Пустой ответ: {asset_key} {period // 60}м, тип ответа {type(result).__name__}")
             except Exception as error:
-                print(f"Подгрузка истории не удалась для {asset_key}/{period}: {error} — копим вживую.")
+                print(f"[history] Не удалось: {asset_key} {period // 60}м: {error} — копим вживую.")
+
+        if await _candle_count(asset_key, TF_HTF) < MIN_HTF_CANDLES:
+            built = await _build_htf_from_ltf(asset_key)
+            if built:
+                print(f"[history] {asset_key}: H1 собран из M5 — {built} свечей")
 
 
 async def start_pocket_option_client():
@@ -840,15 +852,12 @@ async def start_pocket_option_client():
         print("PO_SESSION / PO_UID не заданы — клиент Pocket Option не запущен.")
         return
 
-    missing = resolve_express_pool()
+    missing = resolve_pairs()
     if missing:
-        await _notify(
-            "⚠️ Не удалось найти в Pocket Option следующие express-активы по "
-            f"ключевым словам: {', '.join(missing)}. Они не будут участвовать "
-            "в отборе для express. Обычный режим (EURUSD/GBPUSD/AUDCAD) это не касается."
-        )
-
-    all_subscribed_assets = ASSETS + EXPRESS_ASSET_POOL
+        await _notify(f"⚠️ Не нашёл в библиотеке пары: {', '.join(missing)}. Они не отслеживаются.")
+    if not ACTIVE_ASSETS:
+        await _notify("❌ Не найдено ни одной пары — бот не может работать. Пришли логи [pairs].")
+        return
 
     po_client = PocketOptionClient(logger=True)
 
@@ -864,29 +873,23 @@ async def start_pocket_option_client():
                 "isOptimized": True,
             },
         ),
-        sub_assets=all_subscribed_assets,
-        sub_period=TF_M5,
+        sub_assets=ACTIVE_ASSETS,
+        sub_period=TF_LTF,
     )
 
     @po_client.on.update_close_value
     async def _on_update_close_value(items: list[UpdateCloseValueItem]):
-        now = datetime.now(timezone.utc)
-        m5_bucket = int(now.timestamp() // TF_M5 * TF_M5)
-        m15_bucket = int(now.timestamp() // TF_M15 * TF_M15)
+        ts = time.time()
         for item in items:
             raw_asset = getattr(item, "asset", None) or getattr(item, "symbol", None)
             price = getattr(item, "value", None) or getattr(item, "price", None)
             if raw_asset is None or price is None:
                 continue
-            # Тот же ключ, что и при анализе (Asset.X -> "X"), иначе свечи
-            # копятся под одним именем, а анализ ищет под другим.
-            asset_key = _asset_key(raw_asset)
             try:
                 price_f = float(price)
             except (TypeError, ValueError):
                 continue
-            await _push_candle(asset_key, TF_M5, price_f, m5_bucket)
-            await _push_candle(asset_key, TF_M15, price_f, m15_bucket)
+            await _push_tick(_asset_key(raw_asset), price_f, ts)
 
     @po_client.on.connect
     async def _on_connect():
@@ -897,7 +900,7 @@ async def start_pocket_option_client():
         print("Pocket Option: соединение установлено (демо).")
         if was_reconnect:
             await _notify("✅ Соединение с Pocket Option восстановлено.")
-        asyncio.create_task(_try_preload_history(all_subscribed_assets))
+        asyncio.create_task(_try_preload_history(ACTIVE_ASSETS))
 
     @po_client.on.disconnect
     async def _on_disconnect():
@@ -919,50 +922,67 @@ async def start_pocket_option_client():
 
 
 # ---------------------------------------------------------------------------
-# TELEGRAM ХЕНДЛЕРЫ — БАЗОВЫЙ РЕЖИМ (без изменений)
+# TELEGRAM
 # ---------------------------------------------------------------------------
+
+def _job_name(chat_id: int) -> str:
+    return f"smart_analysis_{chat_id}"
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    job_name = f"auto_analysis_{chat_id}"
-    express_job_name = f"express_analysis_{chat_id}"
-    jobs = context.job_queue.get_jobs_by_name(job_name)
-    express_jobs = context.job_queue.get_jobs_by_name(express_job_name)
+    auto_on = bool(context.job_queue.get_jobs_by_name(_job_name(chat_id)))
 
     po_line = "🟢 Pocket Option: подключено (демо)" if po_connected else "🔴 Pocket Option: нет соединения"
-    hours_line = f"🕐 Рабочее окно: {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 (Берген)"
-    now_status = "🟢 сейчас в рабочем окне" if is_within_working_hours() else "🔴 сейчас вне рабочего окна (бот молчит)"
+    auto_line = "🟢 Автоанализ: ВКЛЮЧЁН" if auto_on else "🔴 Автоанализ: ВЫКЛЮЧЕН"
+    window = "🟢 сейчас в рабочем окне" if is_within_working_hours() else "🔴 сейчас вне рабочего окна (бот молчит)"
+    breaker = "\n⚠️ Circuit breaker активен (низкая точность)" if _circuit_breaker_active else ""
 
-    if jobs:
-        auto_line = "🟢 Автоанализ (базовый): ВКЛЮЧЁН"
-    else:
-        auto_line = "🔴 Автоанализ (базовый): ВЫКЛЮЧЕН"
-
-    if express_jobs:
-        express_line = "🟢 Автоанализ (express): ВКЛЮЧЁН"
-    else:
-        express_line = "🔴 Автоанализ (express): ВЫКЛЮЧЕН"
-
-    assets_label = ", ".join(_asset_key(a).replace("_otc", " OTC") for a in ASSETS)
-    express_pool_label = ", ".join(_asset_key(a).replace("_otc", " OTC") for a in EXPRESS_ASSET_POOL)
-    breaker_line = "\n⚠️ Circuit breaker активен (низкая точность)" if _circuit_breaker_active else ""
+    live = 0
+    for a in ACTIVE_ASSETS:
+        age = await _tick_age(_asset_key(a))
+        if age is not None and age <= STALE_TICKS_SECONDS:
+            live += 1
+    market_line = (
+        f"📈 Котировки идут: {live}/{len(ACTIVE_ASSETS)} пар"
+        if live else "💤 Котировок нет — рынок закрыт (выходные?) или нет подписки"
+    )
+    pairs = ", ".join(_pair_label(_asset_key(a)) for a in ACTIVE_ASSETS) or "— ещё не найдены"
 
     await update.message.reply_text(
-        "✅ POCKET TA BOT работает\n\n"
-        f"{po_line}\n"
-        f"{auto_line}\n"
-        f"{express_line}\n"
-        f"{hours_line}\n"
-        f"{now_status}"
-        f"{breaker_line}\n\n"
-        f"Базовые активы: {assets_label}\n"
-        f"Порог уверенности: {CONFIDENCE_THRESHOLD}% (🔥 от {STRONG_SIGNAL_THRESHOLD}%)\n"
-        f"Экспирация (базовый): {EXPIRATION_SECONDS // 60} мин | Cooldown: {COOLDOWN_MINUTES} мин\n\n"
-        f"Express-пул: {express_pool_label or '— ещё не резолвлен'}\n"
-        f"Фильтр выплаты (express): {PAYOUT_MIN}–{PAYOUT_MAX}% (⚠️ ручной снэпшот, /setpayout)\n"
-        f"Экспирация (express): {EXPRESS_EXPIRATION_SECONDS // 60} мин | интервал: {EXPRESS_INTERVAL_SECONDS // 60} мин\n\n"
+        "✅ FELIX SMART BOT работает\n\n"
+        f"{po_line}\n{auto_line}\n{market_line}\n"
+        f"🕐 Рабочее окно: {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 (Берген)\n"
+        f"{window}{breaker}\n\n"
+        f"Пары: {pairs}\n"
+        f"Стратегия: «Не заходи раньше» (SMC), H1 + M5\n"
+        f"Экспирация: {EXPIRATION_MINUTES} мин | проверка: {', '.join(str(h) for h in CHECK_HORIZONS)} мин\n"
+        f"Cooldown: {COOLDOWN_MINUTES} мин на пару\n\n"
         f"Chat ID: {chat_id}"
     )
+
+
+async def candles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика: реально ли копятся свечи M5 и H1."""
+    if not ACTIVE_ASSETS:
+        await update.message.reply_text("Пары ещё не найдены — проверь /status и логи [pairs].")
+        return
+    lines = ["🕯 Свечи в памяти бота (нужно: H1 ≥ "
+             f"{MIN_HTF_CANDLES}, M5 ≥ {MIN_LTF_CANDLES})\n"]
+    for a in ACTIVE_ASSETS:
+        k = _asset_key(a)
+        m5 = await _candle_count(k, TF_LTF)
+        h1 = await _candle_count(k, TF_HTF)
+        age = await _tick_age(k)
+        if age is None:
+            tick_txt = "котировок не было"
+        elif age < 60:
+            tick_txt = f"тик {int(age)} сек назад"
+        else:
+            tick_txt = f"тик {int(age // 60)} мин назад"
+        ready = "✅" if m5 >= MIN_LTF_CANDLES and h1 >= MIN_HTF_CANDLES else "⏳"
+        lines.append(f"{ready} {_pair_label(k)}: M5 {m5} | H1 {h1} | {tick_txt}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -972,210 +992,90 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Стратегия POCKET TA (классический технический анализ):\n\n"
-        "1. Уровни поддержки/сопротивления — пик силы на 3-4 касаниях (макс 30)\n"
-        "2. Свечной паттерн у уровня — пин-бар/поглощение/доджи (макс 30)\n"
-        "3. Активность (тики цены за свечу) относительно среднего (макс 25)\n"
-        "4. Совпадение с трендом M15 по EMA20/50 — бонус (макс 15)\n"
-        "5. Качество подхода к уровню — направленное движение перед сигналом (макс 10)\n\n"
-        f"Сигнал шлём только если уверенность >= {CONFIDENCE_THRESHOLD}%.\n"
-        f"🔥 отдельная пометка для сигналов от {STRONG_SIGNAL_THRESHOLD}%.\n\n"
-        "Базовый режим: экспирация 5 мин, активы EURUSD/GBPUSD/AUDCAD.\n"
-        "Express-режим (кнопка 🎯 Express): сет из 3 акционных OTC-активов "
-        f"с выплатой {PAYOUT_MIN}-{PAYOUT_MAX}%, экспирация {EXPRESS_EXPIRATION_SECONDS // 60} мин.\n\n"
-        f"Рабочее окно: {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену.\n"
-        "Статистика по факту точности — команда /stats."
+        "Стратегия «Не заходи раньше» (Smart Money):\n\n"
+        "H1:\n"
+        "1. Тренд по структуре (HH+HL / LH+LL)\n"
+        "2. Снятие ликвидности — прокол прошлого минимума/максимума\n"
+        "3. Импульс по тренду с имбалансом (FVG)\n"
+        "4. Не входим на импульсе — ждём возврата цены в FVG\n\n"
+        "M5 (цена в FVG):\n"
+        "5. Снятие локальной ликвидности\n"
+        "6. Слом структуры — на закрытии этой свечи сигнал, вход сразу\n\n"
+        f"Экспирация {EXPIRATION_MINUTES} мин. Статистика через "
+        f"{', '.join(str(h) for h in CHECK_HORIZONS)} мин — /stats.\n"
+        "Один FVG = максимум один сигнал.\n"
+        "Реальные пары: в выходные котировок нет."
     )
 
 
 async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_within_working_hours():
-        await update.message.reply_text(
-            f"🔴 Сейчас вне рабочего окна ({WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену)."
-        )
+    if not ACTIVE_ASSETS:
+        await update.message.reply_text("Пары ещё не найдены — проверь /status.")
         return
-    await update.message.reply_text("⏳ Анализирую активы...")
-    signals = await analyze_many(ASSETS)
-    if not signals:
-        await update.message.reply_text(
-            f"Сейчас нет сигналов с уверенностью >= {CONFIDENCE_THRESHOLD}%."
-        )
-        return
-    for s in signals:
-        await update.message.reply_text(format_signal(s))
-        await record_signal(s["asset"], s["direction"], s["price"], s["confidence"])
+    await update.message.reply_text("⏳ Анализирую пары...")
+    report = []
+    for a in ACTIVE_ASSETS:
+        signal, reason = await analyze_pair(a)
+        if signal:
+            await update.message.reply_text(format_signal(signal))
+            await record_signal(signal)
+        report.append(f"• {_pair_label(_asset_key(a))}: {reason}")
+    await update.message.reply_text("Разбор по парам:\n" + "\n".join(report))
 
 
 async def auto_analysis(context: ContextTypes.DEFAULT_TYPE):
     try:
         await check_pending_outcomes()
-
         if not is_within_working_hours():
             return
-
-        signals = await analyze_many(ASSETS)
-        for s in signals:
-            await context.bot.send_message(
-                chat_id=context.job.chat_id,
-                text=format_signal(s),
-                disable_notification=False,
-            )
-            await record_signal(s["asset"], s["direction"], s["price"], s["confidence"])
+        for a in ACTIVE_ASSETS:
+            signal, _ = await analyze_pair(a)
+            if signal:
+                await context.bot.send_message(chat_id=context.job.chat_id, text=format_signal(signal))
+                await record_signal(signal)
     except Exception as error:
         print(f"Ошибка автоанализа: {error}")
 
 
-async def auto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    job_name = f"auto_analysis_{chat_id}"
-
-    if context.job_queue.get_jobs_by_name(job_name):
-        await update.message.reply_text("✅ Автоанализ (базовый) уже работает.")
-        return
-
-    context.job_queue.run_repeating(
+def _start_job(job_queue, chat_id: int, first: int):
+    job_queue.run_repeating(
         auto_analysis,
         interval=AUTO_ANALYSIS_INTERVAL,
-        first=10,
+        first=first,
         chat_id=chat_id,
-        name=job_name,
+        name=_job_name(chat_id),
     )
+
+
+async def auto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if context.job_queue.get_jobs_by_name(_job_name(chat_id)):
+        await update.message.reply_text("✅ Автоанализ уже работает.")
+        return
+    _start_job(context.job_queue, chat_id, first=10)
     await update.message.reply_text(
-        f"✅ Автоанализ (базовый) запущен. Проверка каждую минуту, только в окно "
+        f"✅ Автоанализ запущен: проверка каждую минуту, в окно "
         f"{WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену."
     )
 
 
 async def auto_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    job_name = f"auto_analysis_{chat_id}"
-    for job in context.job_queue.get_jobs_by_name(job_name):
+    for job in context.job_queue.get_jobs_by_name(_job_name(update.effective_chat.id)):
         job.schedule_removal()
-    await update.message.reply_text("⛔ Автоанализ (базовый) остановлен.")
+    await update.message.reply_text("⛔ Автоанализ остановлен.")
 
-
-# ---------------------------------------------------------------------------
-# TELEGRAM ХЕНДЛЕРЫ — EXPRESS-РЕЖИМ (добавлено)
-# ---------------------------------------------------------------------------
-
-async def express_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_within_working_hours():
-        await update.message.reply_text(
-            f"🔴 Сейчас вне рабочего окна ({WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену)."
-        )
-        return
-    if not EXPRESS_ASSET_POOL:
-        await update.message.reply_text("Express-пул ещё не готов (нет соединения с Pocket Option?). Проверь /status.")
-        return
-    await update.message.reply_text("⏳ Собираю express-сет...")
-    signal_set = await analyze_express_pool()
-    if not signal_set:
-        await update.message.reply_text(
-            f"Сейчас не набралось {EXPRESS_SET_SIZE} активов с выплатой {PAYOUT_MIN}-{PAYOUT_MAX}% "
-            f"и уверенностью >= {CONFIDENCE_THRESHOLD}%."
-        )
-        return
-    set_id = await record_express_set(signal_set)
-    await update.message.reply_text(format_express_set(signal_set, set_id))
-
-
-async def express_auto_analysis(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await check_pending_outcomes()
-
-        if not is_within_working_hours():
-            return
-        if not EXPRESS_ASSET_POOL:
-            return
-
-        signal_set = await analyze_express_pool()
-        if not signal_set:
-            return
-
-        set_id = await record_express_set(signal_set)
-        await context.bot.send_message(
-            chat_id=context.job.chat_id,
-            text=format_express_set(signal_set, set_id),
-            disable_notification=False,
-        )
-    except Exception as error:
-        print(f"Ошибка автоанализа express: {error}")
-
-
-async def express_auto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    job_name = f"express_analysis_{chat_id}"
-
-    if context.job_queue.get_jobs_by_name(job_name):
-        await update.message.reply_text("✅ Автоанализ express уже работает.")
-        return
-
-    context.job_queue.run_repeating(
-        express_auto_analysis,
-        interval=EXPRESS_INTERVAL_SECONDS,
-        first=10,
-        chat_id=chat_id,
-        name=job_name,
-    )
-    await update.message.reply_text(
-        f"✅ Автоанализ express запущен. Проверка каждые {EXPRESS_INTERVAL_SECONDS // 60} мин, "
-        f"только в окно {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену."
-    )
-
-
-async def express_auto_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    job_name = f"express_analysis_{chat_id}"
-    for job in context.job_queue.get_jobs_by_name(job_name):
-        job.schedule_removal()
-    await update.message.reply_text("⛔ Автоанализ express остановлен.")
-
-
-async def setpayout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Использование: /setpayout MICROSOFT 92"""
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text(
-            "Использование: /setpayout <ключевое_слово> <значение>\n"
-            "Например: /setpayout MICROSOFT 90\n\n"
-            f"Доступные ключевые слова: {', '.join(EXPRESS_ASSET_KEYWORDS)}"
-        )
-        return
-
-    keyword, value_str = args[0].upper(), args[1]
-    try:
-        value = float(value_str)
-    except ValueError:
-        await update.message.reply_text("Значение выплаты должно быть числом, например 92")
-        return
-
-    asset_key = _keyword_to_asset_key.get(keyword)
-    if not asset_key:
-        await update.message.reply_text(
-            f"Актив '{keyword}' не найден среди резолвленных. Проверь /status."
-        )
-        return
-
-    await set_payout(asset_key, value)
-    await update.message.reply_text(f"✅ Выплата для {keyword} обновлена: {value:.0f}%")
-
-
-# ---------------------------------------------------------------------------
-# ОБЩЕЕ МЕНЮ И ЗАПУСК
-# ---------------------------------------------------------------------------
 
 MAIN_KEYBOARD = [
     ["📊 Статус", "📈 Стратегия"],
-    ["🔍 Проверить сигнал", "🎯 Express"],
+    ["🔍 Проверить сигнал", "🕯 Свечи"],
     ["▶️ Автоанализ", "⏹️ Стоп автоанализ"],
-    ["▶️ Express авто", "⏹️ Стоп Express авто"],
     ["📉 Статистика"],
 ]
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(MAIN_KEYBOARD, resize_keyboard=True)
-    await update.message.reply_text("POCKET TA BOT запущен.\nВыберите действие:", reply_markup=reply_markup)
+    await update.message.reply_text("FELIX SMART BOT запущен.\nВыберите действие:", reply_markup=reply_markup)
 
 
 async def post_init(application: Application):
@@ -1191,28 +1091,19 @@ async def post_init(application: Application):
         return
 
     chat_id = int(TELEGRAM_CHAT_ID)
-    job_name = f"auto_analysis_{chat_id}"
-
-    if not application.job_queue.get_jobs_by_name(job_name):
-        application.job_queue.run_repeating(
-            auto_analysis,
-            interval=AUTO_ANALYSIS_INTERVAL,
-            first=30,
-            chat_id=chat_id,
-            name=job_name,
-        )
+    if not application.job_queue.get_jobs_by_name(_job_name(chat_id)):
+        _start_job(application.job_queue, chat_id, first=30)
 
     await application.bot.send_message(
         chat_id=chat_id,
         text=(
-            "✅ POCKET TA BOT запущен, автоанализ (базовый) включён автоматически.\n"
-            f"Порог уверенности: {CONFIDENCE_THRESHOLD}% (🔥 от {STRONG_SIGNAL_THRESHOLD}%).\n"
-            f"Экспирация {EXPIRATION_SECONDS // 60} мин, cooldown {COOLDOWN_MINUTES} мин.\n"
+            "✅ FELIX SMART BOT запущен, автоанализ включён.\n"
+            "Стратегия «Не заходи раньше» (SMC): H1 + M5, реальные валютные пары.\n"
+            f"Экспирация {EXPIRATION_MINUTES} мин, статистика через "
+            f"{', '.join(str(h) for h in CHECK_HORIZONS)} мин.\n"
             f"Рабочее окно: {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену.\n\n"
-            "🎯 Добавлен Express-режим — кнопка внизу или команда /express.\n"
-            "Автоанализ express НЕ включается сам — запусти кнопкой '▶️ Express авто', когда будешь готов.\n"
-            "⚠️ Выплата (payout) для express — ручной снэпшот, обновляй /setpayout при изменениях.\n\n"
-            "Проверить статус — /status, статистику — /stats."
+            "🕯 Проверить, копятся ли свечи — кнопка «Свечи» или /candles.\n"
+            "В выходные котировок по реальным парам нет — это нормально."
         ),
     )
 
@@ -1227,27 +1118,21 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("strategy", strategy))
     application.add_handler(CommandHandler("signal", signal_cmd))
+    application.add_handler(CommandHandler("candles", candles_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("auto_start", auto_start))
     application.add_handler(CommandHandler("auto_stop", auto_stop))
-    application.add_handler(CommandHandler("express", express_cmd))
-    application.add_handler(CommandHandler("express_auto_start", express_auto_start))
-    application.add_handler(CommandHandler("express_auto_stop", express_auto_stop))
-    application.add_handler(CommandHandler("setpayout", setpayout_cmd))
 
     application.add_handler(MessageHandler(filters.Regex("^📊 Статус$"), status))
     application.add_handler(MessageHandler(filters.Regex("^📈 Стратегия$"), strategy))
     application.add_handler(MessageHandler(filters.Regex("^🔍 Проверить сигнал$"), signal_cmd))
+    application.add_handler(MessageHandler(filters.Regex("^🕯 Свечи$"), candles_cmd))
     application.add_handler(MessageHandler(filters.Regex("^📉 Статистика$"), stats_cmd))
     application.add_handler(MessageHandler(filters.Regex("^▶️ Автоанализ$"), auto_start))
     application.add_handler(MessageHandler(filters.Regex("^⏹️ Стоп автоанализ$"), auto_stop))
-    application.add_handler(MessageHandler(filters.Regex("^🎯 Express$"), express_cmd))
-    application.add_handler(MessageHandler(filters.Regex("^▶️ Express авто$"), express_auto_start))
-    application.add_handler(MessageHandler(filters.Regex("^⏹️ Стоп Express авто$"), express_auto_stop))
 
     application.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
