@@ -1,4 +1,6 @@
-PRESS-РЕЖИМ (добавлено отдельной кнопкой, работает на общем движке анализа)
+"""
+POCKET TA BOT — сигналы по классическому техническому анализу (Pocket Option OTC)
++ EXPRESS-РЕЖИМ (добавлено отдельной кнопкой, работает на общем движке анализа)
 
 --- БАЗОВЫЙ РЕЖИМ (как было) ---
 Факторы уверенности (сумма нормируется к 100%, максимум 110 баллов сырых):
@@ -40,9 +42,19 @@ PRESS-РЕЖИМ (добавлено отдельной кнопкой, рабо
   сет не отправляется (лучше пропустить тик).
 - Статистика express — отдельно, /stats показывает и обычную точность, и
   отдельно % сетов, где зашли ВСЕ 3 актива (это и есть реальный express-winrate).
+
+--- ИСПРАВЛЕНИЯ (26.09.2026) ---
+- Патч библиотеки pocket_option: fix_timestamp падал с
+  "TypeError: Unsupported type: <class 'int'>" на событии updateStream,
+  из-за чего котировки вообще не доходили до бота. Теперь int/float
+  обрабатываются (см. _patch_pocket_option_timestamp()).
+- В обработчике котировок актив приводится к тому же ключу, что и при
+  анализе (_asset_key). Раньше str(Asset.X) мог давать "Asset.X" вместо
+  "X", и свечи копились под одним именем, а анализ искал под другим.
 """
 
 import os
+import sys
 import time
 import asyncio
 from collections import deque
@@ -57,6 +69,58 @@ from pocket_option import PocketOptionClient
 from pocket_option.constants import Regions
 from pocket_option.contrib.default_init import default_init
 from pocket_option.models import Asset, AuthorizationData, UpdateCloseValueItem
+
+
+# ---------------------------------------------------------------------------
+# ПАТЧ БИБЛИОТЕКИ POCKET OPTION (исправление TypeError в fix_timestamp)
+# ---------------------------------------------------------------------------
+
+def _patch_pocket_option_timestamp():
+    """Библиотечная fix_timestamp не принимает int, а сервер присылает
+    время именно как int. Подменяем функцию во всех модулях pocket_option,
+    которые её импортировали (utils, middlewares и др.)."""
+    try:
+        import pocket_option.utils as po_utils
+        import pocket_option.middlewares  # noqa: F401 — чтобы модуль точно был загружен
+    except Exception as error:
+        print(f"[patch] Не удалось импортировать модули pocket_option: {error}")
+        return
+
+    original = getattr(po_utils, "fix_timestamp", None)
+    if original is None:
+        print("[patch] fix_timestamp не найдена — патч не нужен.")
+        return
+    if getattr(original, "_felix_patched", False):
+        return
+
+    def _safe_fix_timestamp(ts):
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+            for candidate in (float(ts), str(ts)):
+                try:
+                    return original(candidate)
+                except (TypeError, ValueError):
+                    pass
+            value = float(ts)
+            if value > 1e12:  # миллисекунды -> секунды
+                value /= 1000
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        return original(ts)
+
+    _safe_fix_timestamp._felix_patched = True
+
+    patched_modules = []
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("pocket_option") or module is None:
+            continue
+        if getattr(module, "fix_timestamp", None) is original:
+            setattr(module, "fix_timestamp", _safe_fix_timestamp)
+            patched_modules.append(name)
+
+    print(f"[patch] fix_timestamp подменена в: {', '.join(patched_modules)}")
+
+
+_patch_pocket_option_timestamp()
+
 
 # ---------------------------------------------------------------------------
 # КОНФИГ — БАЗОВЫЙ РЕЖИМ (без изменений)
@@ -166,7 +230,7 @@ _notify_chat_id: int | None = None
 _circuit_breaker_active = False
 
 
-def _asset_key(asset: Asset) -> str:
+def _asset_key(asset) -> str:
     return asset.value if hasattr(asset, "value") else str(asset)
 
 
@@ -810,12 +874,19 @@ async def start_pocket_option_client():
         m5_bucket = int(now.timestamp() // TF_M5 * TF_M5)
         m15_bucket = int(now.timestamp() // TF_M15 * TF_M15)
         for item in items:
-            asset_key = getattr(item, "asset", None) or getattr(item, "symbol", None)
+            raw_asset = getattr(item, "asset", None) or getattr(item, "symbol", None)
             price = getattr(item, "value", None) or getattr(item, "price", None)
-            if asset_key is None or price is None:
+            if raw_asset is None or price is None:
                 continue
-            await _push_candle(str(asset_key), TF_M5, float(price), m5_bucket)
-            await _push_candle(str(asset_key), TF_M15, float(price), m15_bucket)
+            # Тот же ключ, что и при анализе (Asset.X -> "X"), иначе свечи
+            # копятся под одним именем, а анализ ищет под другим.
+            asset_key = _asset_key(raw_asset)
+            try:
+                price_f = float(price)
+            except (TypeError, ValueError):
+                continue
+            await _push_candle(asset_key, TF_M5, price_f, m5_bucket)
+            await _push_candle(asset_key, TF_M15, price_f, m15_bucket)
 
     @po_client.on.connect
     async def _on_connect():
@@ -1179,3 +1250,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
