@@ -1,0 +1,3 @@
+python-telegram-bot[job-queue]==21.4
+pocket-option==0.4.0
+pandas==2.2.3
