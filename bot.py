@@ -24,8 +24,12 @@ M5 (пока цена вернулась в FVG):
 Свечи M5 и H1 бот собирает сам из потока котировок + подгружает историю при
 старте. Команда /candles показывает, сколько свечей накоплено по каждой паре.
 
-ВАЖНО: реальные валютные пары не торгуются в выходные — с вечера пятницы до
-вечера воскресенья котировок не будет, это нормально.
+РАСПИСАНИЕ: понедельник–пятница, 06:00–22:00 по Бергену (Europe/Oslo).
+Суббота и воскресенье — выходной: бот молчит и не строит свечи.
+
+ЗАЩИТА ОТ ФАЛЬШИВЫХ КОТИРОВОК: в выходные Pocket Option присылает застывшую
+последнюю цену. Бот игнорирует тики в субботу/воскресенье, а котировку считает
+живой, только если цена реально меняется — иначе «рынок закрыт».
 
 Исправления библиотеки pocket_option (перенесены из рабочего кода):
 - патч fix_timestamp (TypeError: Unsupported type: <class 'int'>);
@@ -152,9 +156,10 @@ CIRCUIT_BREAKER_THRESHOLD_PCT = 40
 
 TIMEZONE = ZoneInfo("Europe/Oslo")
 WORK_START_HOUR = 6
-WORK_END_HOUR = 20
+WORK_END_HOUR = 22
+WEEKEND_DAYS = (5, 6)          # суббота, воскресенье — выходной
 
-STALE_TICKS_SECONDS = 300      # нет котировок дольше 5 мин — считаем, что рынок закрыт
+STALE_TICKS_SECONDS = 300      # цена не менялась дольше 5 мин — считаем, что рынок закрыт
 
 # ---------------------------------------------------------------------------
 # СОСТОЯНИЕ
@@ -163,7 +168,7 @@ STALE_TICKS_SECONDS = 300      # нет котировок дольше 5 мин
 ACTIVE_ASSETS: list = []                      # заполняется resolve_pairs()
 
 candle_store: dict[tuple[str, int], deque] = {}
-last_tick: dict[str, tuple[float, float]] = {}   # asset_key -> (unix time, цена)
+last_tick: dict[str, tuple[float, float]] = {}   # asset_key -> (время последнего ИЗМЕНЕНИЯ цены, цена)
 _store_lock = asyncio.Lock()
 
 signal_history: list[dict] = []
@@ -226,9 +231,20 @@ def _maxlen(period: int) -> int:
     return MAX_HTF_CANDLES if period == TF_HTF else MAX_LTF_CANDLES
 
 
+def is_weekend() -> bool:
+    return datetime.now(TIMEZONE).weekday() in WEEKEND_DAYS
+
+
 async def _push_tick(asset_key: str, price: float, ts: float):
+    if is_weekend():
+        return                                  # выходные — котировки фальшивые (застывшие)
     async with _store_lock:
-        last_tick[asset_key] = (ts, price)
+        prev = last_tick.get(asset_key)
+        if prev is not None and prev[1] == price:
+            if ts - prev[0] > STALE_TICKS_SECONDS:
+                return                          # цена давно застыла — свечи не строим
+        else:
+            last_tick[asset_key] = (ts, price)  # время обновляется только при реальном изменении цены
         for period in (TF_LTF, TF_HTF):
             bucket = int(ts // period * period)
             key = (asset_key, period)
@@ -312,6 +328,8 @@ async def _tick_age(asset_key: str) -> float | None:
 
 def is_within_working_hours() -> bool:
     now_local = datetime.now(TIMEZONE)
+    if now_local.weekday() in WEEKEND_DAYS:
+        return False
     return WORK_START_HOUR <= now_local.hour < WORK_END_HOUR
 
 
@@ -935,7 +953,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     po_line = "🟢 Pocket Option: подключено (демо)" if po_connected else "🔴 Pocket Option: нет соединения"
     auto_line = "🟢 Автоанализ: ВКЛЮЧЁН" if auto_on else "🔴 Автоанализ: ВЫКЛЮЧЕН"
-    window = "🟢 сейчас в рабочем окне" if is_within_working_hours() else "🔴 сейчас вне рабочего окна (бот молчит)"
+    if is_weekend():
+        window = "💤 сегодня выходной (бот молчит)"
+    elif is_within_working_hours():
+        window = "🟢 сейчас в рабочем окне"
+    else:
+        window = "🔴 сейчас вне рабочего окна (бот молчит)"
     breaker = "\n⚠️ Circuit breaker активен (низкая точность)" if _circuit_breaker_active else ""
 
     live = 0
@@ -943,16 +966,18 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         age = await _tick_age(_asset_key(a))
         if age is not None and age <= STALE_TICKS_SECONDS:
             live += 1
-    market_line = (
-        f"📈 Котировки идут: {live}/{len(ACTIVE_ASSETS)} пар"
-        if live else "💤 Котировок нет — рынок закрыт (выходные?) или нет подписки"
-    )
+    if is_weekend():
+        market_line = "💤 Выходные — рынок закрыт, котировки игнорируются"
+    elif live:
+        market_line = f"📈 Котировки идут: {live}/{len(ACTIVE_ASSETS)} пар"
+    else:
+        market_line = "💤 Котировок нет — цена не меняется (рынок закрыт?)"
     pairs = ", ".join(_pair_label(_asset_key(a)) for a in ACTIVE_ASSETS) or "— ещё не найдены"
 
     await update.message.reply_text(
         "✅ FELIX SMART BOT работает\n\n"
         f"{po_line}\n{auto_line}\n{market_line}\n"
-        f"🕐 Рабочее окно: {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 (Берген)\n"
+        f"🕐 Рабочее окно: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 (Берген), сб–вс выходной\n"
         f"{window}{breaker}\n\n"
         f"Пары: {pairs}\n"
         f"Стратегия: «Не заходи раньше» (SMC), H1 + M5\n"
@@ -1004,7 +1029,7 @@ async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Экспирация {EXPIRATION_MINUTES} мин. Статистика через "
         f"{', '.join(str(h) for h in CHECK_HORIZONS)} мин — /stats.\n"
         "Один FVG = максимум один сигнал.\n"
-        "Реальные пары: в выходные котировок нет."
+        f"Работа: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену, сб–вс выходной."
     )
 
 
@@ -1054,7 +1079,7 @@ async def auto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _start_job(context.job_queue, chat_id, first=10)
     await update.message.reply_text(
-        f"✅ Автоанализ запущен: проверка каждую минуту, в окно "
+        f"✅ Автоанализ запущен: проверка каждую минуту, пн–пт "
         f"{WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену."
     )
 
@@ -1101,9 +1126,9 @@ async def post_init(application: Application):
             "Стратегия «Не заходи раньше» (SMC): H1 + M5, реальные валютные пары.\n"
             f"Экспирация {EXPIRATION_MINUTES} мин, статистика через "
             f"{', '.join(str(h) for h in CHECK_HORIZONS)} мин.\n"
-            f"Рабочее окно: {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену.\n\n"
+            f"Рабочее окно: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену, сб–вс выходной.\n\n"
             "🕯 Проверить, копятся ли свечи — кнопка «Свечи» или /candles.\n"
-            "В выходные котировок по реальным парам нет — это нормально."
+            "В выходные бот молчит и не строит свечи из застывших котировок."
         ),
     )
 
