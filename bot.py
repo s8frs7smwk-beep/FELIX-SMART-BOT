@@ -42,6 +42,8 @@ import os
 import sys
 import time
 import inspect
+import random
+import typing
 import asyncio
 from collections import deque
 from datetime import datetime, timezone, timedelta
@@ -708,82 +710,187 @@ po_client: PocketOptionClient | None = None
 po_connected = False
 _was_ever_connected = False
 
-_HISTORY_PARAM_ALIASES = {
+# Логические поля запроса истории и возможные имена этих полей в библиотеке.
+_HISTORY_FIELD_ALIASES = {
     "asset": ("asset", "symbol", "active", "asset_name", "pair", "instrument"),
     "period": ("period", "timeframe", "tf", "interval", "candle_period"),
     "time": ("time", "end_time", "timestamp", "to", "end", "end_ts"),
-    "offset": ("offset", "count", "limit", "amount"),
+    "offset": ("offset",),
+    "count": ("count", "limit", "amount", "size"),
+    "index": ("index", "request_id", "req_id", "id"),
 }
 _history_api_logged = False
+_pending_history: deque = deque(maxlen=200)   # (asset_key, period) в порядке запросов
 
 
-def _log_history_api(func):
-    """Один раз пишет в логи, как устроена функция истории в библиотеке —
-    если подгрузка не заработает, по этим строкам сразу видно, что ей нужно."""
+def _history_request_model(func):
+    """load_history_period принимает ОДИН аргумент — объект запроса.
+    Достаём его тип из аннотации функции (обычно это pydantic-модель)."""
+    unwrapped = inspect.unwrap(func)
     try:
-        print(f"[history] Сигнатура: {inspect.signature(func)}")
+        params = [p for p in inspect.signature(unwrapped).parameters.values() if p.name != "self"]
+    except (TypeError, ValueError):
+        return None
+    if not params:
+        return None
+    param = params[0]
+    try:
+        hints = typing.get_type_hints(unwrapped)
+    except Exception:
+        hints = {}
+    model = hints.get(param.name, param.annotation)
+    if model is inspect.Parameter.empty or isinstance(model, str):
+        return None
+    return model
+
+
+def _log_history_api(func, model):
+    """Один раз пишет в логи, как устроен запрос истории в библиотеке."""
+    try:
+        print(f"[history] Сигнатура: {inspect.signature(inspect.unwrap(func))}")
     except Exception as error:
         print(f"[history] Сигнатура недоступна: {error}")
+    if model is not None:
+        fields = getattr(model, "model_fields", None)
+        if fields:
+            desc = ", ".join(
+                f"{name}(alias={info.alias})" if info.alias else name for name, info in fields.items()
+            )
+            print(f"[history] Модель запроса: {getattr(model, '__name__', model)} — поля: {desc}")
+        else:
+            print(f"[history] Тип аргумента: {model}")
     try:
-        unwrapped = inspect.unwrap(func)
-        print(f"[history] Сигнатура без обёрток: {inspect.signature(unwrapped)}")
-        source = inspect.getsource(unwrapped).splitlines()[:40]
-        print("[history] Исходник load_history_period:")
+        source = inspect.getsource(inspect.unwrap(func)).splitlines()[:25]
         for line in source:
             print(f"[history] | {line}")
-    except Exception as error:
-        print(f"[history] Исходник недоступен: {error}")
+    except Exception:
+        pass
+
+
+def _history_values(asset, period: int, count: int, asset_as_str: bool) -> dict:
+    now = int(time.time())
+    return {
+        "asset": _asset_key(asset) if asset_as_str else asset,
+        "period": period,
+        "time": now,
+        "offset": count * period,       # в протоколе Pocket Option offset — глубина в секундах
+        "count": count,
+        "index": now * 100 + random.randint(0, 99),
+    }
+
+
+def _build_history_payloads(model, asset, period: int, count: int) -> list:
+    """Варианты объекта запроса — от самого вероятного к запасным."""
+    payloads = []
+    fields = getattr(model, "model_fields", None) if model is not None else None
+
+    for asset_as_str in (False, True):
+        vals = _history_values(asset, period, count, asset_as_str)
+        if fields:
+            by_name, by_alias = {}, {}
+            for fname, finfo in fields.items():
+                keys = {fname.lower()}
+                if finfo.alias:
+                    keys.add(finfo.alias.lower())
+                for logical, aliases in _HISTORY_FIELD_ALIASES.items():
+                    if keys & set(aliases):
+                        by_name[fname] = vals[logical]
+                        by_alias[finfo.alias or fname] = vals[logical]
+                        break
+            for data in (by_name, by_alias):
+                try:
+                    payloads.append(model.model_validate(data))
+                except Exception:
+                    try:
+                        payloads.append(model(**data))
+                    except Exception:
+                        pass
+        # запасной вариант — обычный словарь в формате протокола Pocket Option
+        payloads.append({
+            "asset": vals["asset"] if asset_as_str else _asset_key(asset),
+            "index": vals["index"],
+            "time": vals["time"],
+            "offset": vals["offset"],
+            "period": period,
+        })
+    return payloads
 
 
 async def _call_load_history(asset, period: int, count: int):
     global _history_api_logged
 
     func = po_client.emit.load_history_period
+    model = _history_request_model(func)
     if not _history_api_logged:
         _history_api_logged = True
-        _log_history_api(func)
-
-    now = int(time.time())
-    offset = count * period
-    values = {"asset": asset, "period": period, "time": now, "offset": offset}
-
-    try:
-        params = [
-            p for p in inspect.signature(inspect.unwrap(func)).parameters.values()
-            if p.name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
-        ]
-    except (TypeError, ValueError):
-        params = []
-
-    kwargs = {}
-    asset_param = None
-    for logical, aliases in _HISTORY_PARAM_ALIASES.items():
-        for p in params:
-            if p.name in aliases:
-                value = values[logical]
-                if logical == "offset" and p.name != "offset":
-                    value = count          # count/limit — число свечей, а не секунды
-                kwargs[p.name] = value
-                if logical == "asset":
-                    asset_param = p.name
-                break
-
-    attempts = []
-    if kwargs:
-        attempts.append(((), dict(kwargs)))
-        if asset_param:
-            attempts.append(((), {**kwargs, asset_param: _asset_key(asset)}))
-    attempts.append(((asset, period, now, offset), {}))
-    attempts.append(((_asset_key(asset), period, now, offset), {}))
+        _log_history_api(func, model)
 
     last_error = None
-    for args, kw in attempts:
+    for payload in _build_history_payloads(model, asset, period, count):
         try:
-            return await asyncio.wait_for(func(*args, **kw), timeout=HISTORY_TIMEOUT_SECONDS)
-        except TypeError as error:
+            _pending_history.append((_asset_key(asset), period))
+            return await asyncio.wait_for(func(payload), timeout=HISTORY_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            # запрос ушёл, но ответ не вернулся из функции — возможно, он придёт событием
+            return None
+        except Exception as error:
+            if _pending_history:
+                _pending_history.pop()
             last_error = error
             continue
-    raise last_error or RuntimeError("не удалось вызвать load_history_period")
+    raise last_error or RuntimeError("не удалось собрать запрос истории")
+
+
+def _get_field(obj, *names):
+    for name in names:
+        value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+async def _on_history_event(payload):
+    """Ответ с историей, пришедший отдельным событием от сервера."""
+    try:
+        raw_asset = _get_field(payload, "asset", "symbol", "active")
+        period = _get_field(payload, "period", "timeframe")
+        asset_key = _asset_key(raw_asset) if raw_asset is not None else None
+        if asset_key is None or period is None:
+            if not _pending_history:
+                print(f"[history] Событие без актива/периода, тип {type(payload).__name__}")
+                return
+            p_asset, p_period = _pending_history.popleft()
+            asset_key = asset_key or p_asset
+            period = period or p_period
+        period = int(period)
+        parsed = _parse_history(payload, period)
+        if not parsed:
+            print(f"[history] Событие: пусто для {asset_key} {period // 60}м")
+            return
+        await _seed_candles(asset_key, period, parsed)
+        print(f"[history] Событие: подгружено {asset_key} {period // 60}м — свечей {len(parsed)}")
+        if period == TF_LTF and await _candle_count(asset_key, TF_HTF) < MIN_HTF_CANDLES:
+            built = await _build_htf_from_ltf(asset_key)
+            print(f"[history] {asset_key}: H1 собран из M5 — {built} свечей")
+    except Exception as error:
+        print(f"[history] Ошибка обработки события истории: {error}")
+
+
+def _register_history_events(client):
+    """Подписываемся на все события библиотеки, похожие на ответ с историей."""
+    on = client.on
+    names = [n for n in dir(on) if not n.startswith("_")]
+    print(f"[history] События библиотеки: {', '.join(names)}")
+    hooked = []
+    for name in names:
+        low = name.lower()
+        if "history" in low or "candle" in low:
+            try:
+                getattr(on, name)(_on_history_event)
+                hooked.append(name)
+            except Exception as error:
+                print(f"[history] Не удалось подписаться на {name}: {error}")
+    print(f"[history] Подписка на ответы истории: {', '.join(hooked) or 'нет подходящих событий'}")
 
 
 def _to_unix(value) -> int:
@@ -848,19 +955,24 @@ async def _try_preload_history(assets: list):
         for period, count in ((TF_LTF, HISTORY_LTF_COUNT), (TF_HTF, HISTORY_HTF_COUNT)):
             try:
                 result = await _call_load_history(asset, period, count)
-                parsed = _parse_history(result, period)
+                parsed = _parse_history(result, period) if result is not None else []
                 if parsed:
                     await _seed_candles(asset_key, period, parsed)
                     print(f"[history] Подгружено: {asset_key} {period // 60}м — свечей {len(parsed)}")
-                else:
-                    print(f"[history] Пустой ответ: {asset_key} {period // 60}м, тип ответа {type(result).__name__}")
+                elif result is not None:
+                    print(f"[history] Ответ без свечей: {asset_key} {period // 60}м, тип {type(result).__name__}")
             except Exception as error:
                 print(f"[history] Не удалось: {asset_key} {period // 60}м: {error} — копим вживую.")
+            await asyncio.sleep(0.3)   # не заваливаем сервер запросами
 
-        if await _candle_count(asset_key, TF_HTF) < MIN_HTF_CANDLES:
-            built = await _build_htf_from_ltf(asset_key)
-            if built:
-                print(f"[history] {asset_key}: H1 собран из M5 — {built} свечей")
+    await asyncio.sleep(10)            # даём время прийти ответам-событиям
+    for asset in assets:
+        asset_key = _asset_key(asset)
+        m5 = await _candle_count(asset_key, TF_LTF)
+        h1 = await _candle_count(asset_key, TF_HTF)
+        if h1 < MIN_HTF_CANDLES and m5 > h1:
+            h1 = await _build_htf_from_ltf(asset_key)
+        print(f"[history] Итог {asset_key}: M5 {m5} | H1 {h1}")
 
 
 async def start_pocket_option_client():
@@ -894,6 +1006,11 @@ async def start_pocket_option_client():
         sub_assets=ACTIVE_ASSETS,
         sub_period=TF_LTF,
     )
+
+    try:
+        _register_history_events(po_client)
+    except Exception as error:
+        print(f"[history] Не удалось подписаться на события истории: {error}")
 
     @po_client.on.update_close_value
     async def _on_update_close_value(items: list[UpdateCloseValueItem]):
