@@ -263,13 +263,17 @@ async def _push_tick(asset_key: str, price: float, ts: float):
 
 
 async def _seed_candles(asset_key: str, period: int, candles: list[dict]):
-    """Вливает историю в хранилище. Живые свечи важнее исторических
-    (они свежее), поэтому при совпадении времени остаётся живая."""
+    """Вливает историю в хранилище. Для закрытых свечей история точнее
+    (живая свеча могла начаться с середины, H1 могла быть собрана из M5),
+    поэтому побеждает история. Текущая формирующаяся свеча — всегда живая."""
     key = (asset_key, period)
+    current_bucket = int(time.time() // period * period)
     async with _store_lock:
-        merged = {c["time"]: dict(c) for c in candles}
-        for c in candle_store.get(key, []):
-            merged[c["time"]] = c
+        merged = {c["time"]: c for c in candle_store.get(key, [])}
+        for c in candles:
+            if c["time"] == current_bucket and c["time"] in merged:
+                continue
+            merged[c["time"]] = dict(c)
         ordered = sorted(merged.values(), key=lambda c: c["time"])[-_maxlen(period):]
         candle_store[key] = deque(ordered, maxlen=_maxlen(period))
 
@@ -949,30 +953,60 @@ def _parse_history(result, period: int) -> list[dict]:
     return sorted(candles.values(), key=lambda c: c["time"])
 
 
-async def _try_preload_history(assets: list):
-    for asset in assets:
-        asset_key = _asset_key(asset)
-        for period, count in ((TF_LTF, HISTORY_LTF_COUNT), (TF_HTF, HISTORY_HTF_COUNT)):
-            try:
-                result = await _call_load_history(asset, period, count)
-                parsed = _parse_history(result, period) if result is not None else []
-                if parsed:
-                    await _seed_candles(asset_key, period, parsed)
-                    print(f"[history] Подгружено: {asset_key} {period // 60}м — свечей {len(parsed)}")
-                elif result is not None:
-                    print(f"[history] Ответ без свечей: {asset_key} {period // 60}м, тип {type(result).__name__}")
-            except Exception as error:
-                print(f"[history] Не удалось: {asset_key} {period // 60}м: {error} — копим вживую.")
-            await asyncio.sleep(0.3)   # не заваливаем сервер запросами
+HISTORY_RETRIES = 3
 
-    await asyncio.sleep(10)            # даём время прийти ответам-событиям
+
+async def _request_history(asset, period: int, count: int):
+    asset_key = _asset_key(asset)
+    try:
+        result = await _call_load_history(asset, period, count)
+        parsed = _parse_history(result, period) if result is not None else []
+        if parsed:
+            await _seed_candles(asset_key, period, parsed)
+            print(f"[history] Подгружено: {asset_key} {period // 60}м — свечей {len(parsed)}")
+        elif result is not None:
+            print(f"[history] Ответ без свечей: {asset_key} {period // 60}м, тип {type(result).__name__}")
+    except Exception as error:
+        print(f"[history] Не удалось: {asset_key} {period // 60}м: {error} — копим вживую.")
+
+
+async def _try_preload_history(assets: list):
+    plan = {_asset_key(a): (a, [TF_LTF, TF_HTF]) for a in assets}
+
+    for attempt in range(1, HISTORY_RETRIES + 1):
+        if attempt > 1:
+            names = ", ".join(f"{k} ({'/'.join(str(p // 60) + 'м' for p in ps)})" for k, (_, ps) in plan.items())
+            print(f"[history] Повторный запрос #{attempt - 1}: {names}")
+
+        for asset, periods in plan.values():
+            for period in periods:
+                count = HISTORY_LTF_COUNT if period == TF_LTF else HISTORY_HTF_COUNT
+                await _request_history(asset, period, count)
+                await asyncio.sleep(0.5)   # не заваливаем сервер запросами
+
+        await asyncio.sleep(10)            # даём время прийти ответам-событиям
+
+        next_plan = {}
+        for key, (asset, _) in plan.items():
+            missing = []
+            if await _candle_count(key, TF_LTF) < MIN_LTF_CANDLES:
+                missing.append(TF_LTF)
+            if await _candle_count(key, TF_HTF) < MIN_HTF_CANDLES:
+                missing.append(TF_HTF)
+            if missing:
+                next_plan[key] = (asset, missing)
+        plan = next_plan
+        if not plan:
+            break
+
     for asset in assets:
-        asset_key = _asset_key(asset)
-        m5 = await _candle_count(asset_key, TF_LTF)
-        h1 = await _candle_count(asset_key, TF_HTF)
+        key = _asset_key(asset)
+        m5 = await _candle_count(key, TF_LTF)
+        h1 = await _candle_count(key, TF_HTF)
         if h1 < MIN_HTF_CANDLES and m5 > h1:
-            h1 = await _build_htf_from_ltf(asset_key)
-        print(f"[history] Итог {asset_key}: M5 {m5} | H1 {h1}")
+            h1 = await _build_htf_from_ltf(key)
+        ready = "✅" if m5 >= MIN_LTF_CANDLES and h1 >= MIN_HTF_CANDLES else "⏳ копим вживую"
+        print(f"[history] Итог {key}: M5 {m5} | H1 {h1} {ready}")
 
 
 async def start_pocket_option_client():
