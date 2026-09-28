@@ -47,6 +47,7 @@ M5 (пока цена вернулась в FVG):
   с запасными вариантами вызова и таймаутом.
 """
 
+import io
 import os
 import sys
 import time
@@ -542,6 +543,20 @@ def find_bullish_ltf_confirmation(df: pd.DataFrame, fvg_bottom: float, fvg_top: 
     return None
 
 
+def _time_label(ts: int) -> str:
+    return datetime.fromtimestamp(ts, TIMEZONE).strftime("%d.%m %H:%M")
+
+
+def _trend_text(trend_dir: str, basis: str, sign: int) -> str:
+    """Тренд словами в координатах ИСХОДНОГО графика (для продажи график зеркальный)."""
+    if trend_dir == "FLAT":
+        return "без тренда (структура смешанная)"
+    real = trend_dir if sign == 1 else ("DOWN" if trend_dir == "UP" else "UP")
+    word = "вверх" if real == "UP" else "вниз"
+    how = "по структуре" if basis == "structure" else "по EMA"
+    return f"{word} {how}"
+
+
 async def analyze_pair(asset) -> tuple[dict | None, str]:
     """Возвращает (сигнал или None, короткое объяснение для /signal)."""
     asset_key = _asset_key(asset)
@@ -571,12 +586,15 @@ async def analyze_pair(asset) -> tuple[dict | None, str]:
             continue
         trend_dir, basis = htf_trend(h.iloc[:setup["sweep_index"]])
         if trend_dir != "UP":      # в зеркале "UP" = нисходящий тренд оригинала
-            reasons.append(f"FVG {'вверх' if sign == 1 else 'вниз'} есть, но против тренда H1")
+            reasons.append(
+                f"FVG {'вверх' if sign == 1 else 'вниз'} от {_time_label(setup['fvg_time'])} есть, "
+                f"но тренд H1 до снятия: {_trend_text(trend_dir, basis, sign)}"
+            )
             continue
         candidates.append((setup["fvg_time"], direction, sign, setup, trend_label(direction, basis)))
 
     if not candidates:
-        return None, reasons[0] if reasons else "H1: нет снятия ликвидности + FVG по тренду"
+        return None, "; ".join(reasons) if reasons else "H1: нет снятия ликвидности + FVG"
 
     candidates.sort(key=lambda c: c[0], reverse=True)   # самый свежий FVG первым
     signal = None
@@ -1326,6 +1344,35 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Присылает CSV со всеми свечами H1 и M5 по всем парам — для разбора и бэктеста."""
+    lines = ["pair,tf,time_utc,time_bergen,open,high,low,close"]
+    total = 0
+    async with _store_lock:
+        snapshot = {k: list(v) for k, v in candle_store.items()}
+    for (asset_key, period), candles in sorted(snapshot.items()):
+        tf = "H1" if period == TF_HTF else "M5"
+        for c in candles:
+            t = int(c["time"])
+            utc = datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M")
+            local = datetime.fromtimestamp(t, TIMEZONE).strftime("%Y-%m-%d %H:%M")
+            lines.append(
+                f"{_pair_label(asset_key)},{tf},{utc},{local},"
+                f"{c['open']},{c['high']},{c['low']},{c['close']}"
+            )
+            total += 1
+    if total == 0:
+        await update.message.reply_text("Свечей в памяти пока нет — экспортировать нечего.")
+        return
+    stamp = datetime.now(TIMEZONE).strftime("%Y%m%d_%H%M")
+    data = io.BytesIO("\n".join(lines).encode("utf-8"))
+    await update.message.reply_document(
+        document=data,
+        filename=f"felix_smart_candles_{stamp}.csv",
+        caption=f"📦 Свечи H1 и M5 по всем парам ({total} строк). Перешли этот файл в чат с Claude.",
+    )
+
+
 async def candles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Диагностика: реально ли копятся свечи M5 и H1."""
     if not ACTIVE_ASSETS:
@@ -1448,7 +1495,7 @@ MAIN_KEYBOARD = [
     ["📊 Статус", "📈 Стратегия"],
     ["🔍 Проверить сигнал", "🕯 Свечи"],
     ["▶️ Автоанализ", "⏹️ Стоп автоанализ"],
-    ["📉 Статистика"],
+    ["📉 Статистика", "📦 Экспорт свечей"],
 ]
 
 
@@ -1502,6 +1549,7 @@ def main():
     application.add_handler(CommandHandler("strategy", strategy))
     application.add_handler(CommandHandler("signal", signal_cmd))
     application.add_handler(CommandHandler("candles", candles_cmd))
+    application.add_handler(CommandHandler("export", export_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("auto_start", auto_start))
     application.add_handler(CommandHandler("auto_stop", auto_stop))
@@ -1510,6 +1558,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^📈 Стратегия$"), strategy))
     application.add_handler(MessageHandler(filters.Regex("^🔍 Проверить сигнал$"), signal_cmd))
     application.add_handler(MessageHandler(filters.Regex("^🕯 Свечи$"), candles_cmd))
+    application.add_handler(MessageHandler(filters.Regex("^📦 Экспорт свечей$"), export_cmd))
     application.add_handler(MessageHandler(filters.Regex("^📉 Статистика$"), stats_cmd))
     application.add_handler(MessageHandler(filters.Regex("^▶️ Автоанализ$"), auto_start))
     application.add_handler(MessageHandler(filters.Regex("^⏹️ Стоп автоанализ$"), auto_stop))
