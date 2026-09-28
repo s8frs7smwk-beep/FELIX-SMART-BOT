@@ -9,7 +9,8 @@ H1:
  2. Снятие ликвидности: свеча H1 прокалывает последний swing-минимум — откат
     внутри тренда (для покупки) или последний swing-максимум (для продажи).
  3. Импульс с имбалансом: сразу после снятия — сильная свеча по тренду,
-    оставившая FVG (разрыв между 1-й и 3-й свечой).
+    оставившая FVG (разрыв между 1-й и 3-й свечой). Три свечи FVG должны идти
+    подряд по времени — «разрыв» через дыру в данных не считается имбалансом.
  4. «Не заходи раньше»: на импульсе НЕ входим, ждём возврата цены в зону FVG.
     FVG считается сломанным, если свеча H1 закрылась за его дальней границей.
 M5 (пока цена вернулась в FVG):
@@ -17,6 +18,8 @@ M5 (пока цена вернулась в FVG):
     внутри или у зоны FVG.
  6. Слом структуры (BOS) — закрытие M5 за локальным максимумом/минимумом.
     На закрытии этой свечи приходит сигнал: вход сразу.
+    Подтверждение ищется только в свечах ПОСЛЕ последнего перерыва в котировках,
+    и последняя закрытая M5 должна быть только что закрывшейся (не старой).
 
 Экспирация сигнала — 30 минут. Бот сам проверяет цену через 15 / 30 / 60 минут
 и ведёт статистику (/stats). Один и тот же FVG даёт максимум один сигнал.
@@ -24,18 +27,24 @@ M5 (пока цена вернулась в FVG):
 Свечи M5 и H1 бот собирает сам из потока котировок + подгружает историю при
 старте. Команда /candles показывает, сколько свечей накоплено по каждой паре.
 
-РАСПИСАНИЕ: понедельник–пятница, 06:00–22:00 по Бергену (Europe/Oslo).
-Суббота и воскресенье — выходной: бот молчит и не строит свечи.
+РАСПИСАНИЕ: сигналы — понедельник–пятница, 06:00–22:00 по Бергену (Europe/Oslo).
+Свечи в будни копятся круглосуточно (нужно для структуры H1), но сигналы вне
+окна не отправляются. Суббота и воскресенье — выходной: бот молчит и не строит свечи.
 
 ЗАЩИТА ОТ ФАЛЬШИВЫХ КОТИРОВОК: в выходные Pocket Option присылает застывшую
 последнюю цену. Бот игнорирует тики в субботу/воскресенье, а котировку считает
 живой, только если цена реально меняется — иначе «рынок закрыт».
+Из подгруженной истории выбрасываются выходные «плоские» свечи (high = low):
+иначе они создают ложные равные уровни ликвидности и ломают структуру H1.
 
 НАДЁЖНОСТЬ И ДИАГНОСТИКА:
 - фоновая догрузка истории каждые 15 мин для пар, где она не пришла при старте;
-- лог «[alive]» в Railway: через 5 мин после старта и дальше раз в час —
-  соединение, свечи, возраст тика и текущий этап SMC по каждой паре;
-- лог «[smc]» при каждой смене этапа по паре (видно, что отсекает сетапы);
+  M5-история запрашивается с уменьшающейся глубиной (600 → 288 → 144 свечи);
+- если ответ истории H1 пришёл мелкими свечами/тиками, из него же строится M5;
+- после паузы в котировках (> 5 мин) бот сам догружает историю, чтобы закрыть дыру;
+- сообщение в Telegram, если отдельная пара молчит > 30 мин, а остальные работают;
+- лог «[alive]» в Railway: через 5 мин после старта и дальше раз в час;
+- лог «[smc]» при каждой смене этапа по паре;
 - сообщение в Telegram, если в рабочее время котировки не приходят > 10 мин,
   и сообщение, когда они вернулись;
 - ошибки Telegram (в т.ч. Conflict) пишутся в лог коротко, без падения.
@@ -140,8 +149,8 @@ TF_HTF = 60 * 60       # H1 — старший ТФ (тренд, ликвидн�
 
 MAX_LTF_CANDLES = 600
 MAX_HTF_CANDLES = 200
-HISTORY_LTF_COUNT = 600    # сколько свечей M5 просить при подгрузке истории
-HISTORY_HTF_COUNT = 150    # сколько свечей H1 просить при подгрузке истории
+HISTORY_LTF_COUNTS = (600, 288, 144)   # глубина M5-истории: 1-я попытка, 2-я, 3-я и дальше
+HISTORY_HTF_COUNT = 150                # сколько свечей H1 просить при подгрузке истории
 HISTORY_TIMEOUT_SECONDS = 20
 
 MIN_HTF_CANDLES = 30       # меньше — H1 анализ не запускаем
@@ -178,6 +187,8 @@ HISTORY_BG_RETRY_MINUTES = 15  # фоновая догрузка истории 
 HEARTBEAT_FIRST_MINUTES = 5    # первый лог «[alive]» после старта
 HEARTBEAT_MINUTES = 60         # дальше лог «[alive]» раз в час
 TICK_ALERT_SECONDS = 600       # нет котировок > 10 мин в рабочее время — сообщение в Telegram
+GAP_BACKFILL_SECONDS = 300     # пауза в котировках > 5 мин — после неё догружаем историю
+PAIR_SILENT_SECONDS = 1800     # пара молчит > 30 мин, а остальные работают — сообщение
 
 # ---------------------------------------------------------------------------
 # СОСТОЯНИЕ
@@ -201,6 +212,9 @@ _started_at = time.time()
 last_reason: dict[str, str] = {}              # asset_key -> последний этап SMC
 _last_analysis_at: float | None = None
 _ticks_alert_sent = False
+_quotes_gap_started: float | None = None      # когда котировки по всем парам остановились
+_silent_pairs_notified: set[str] = set()      # пары, про молчание которых уже написали
+_bg_history_round = 0                         # номер фоновой догрузки (для глубины M5)
 _background_tasks: list = []                  # ссылки на фоновые задачи, чтобы их не собрал GC
 
 
@@ -267,6 +281,19 @@ def is_weekend() -> bool:
     return datetime.now(TIMEZONE).weekday() in WEEKEND_DAYS
 
 
+def _is_weekend_filler(c: dict) -> bool:
+    """Фальшивая выходная свеча: вся суббота по UTC, а также «плоские» свечи
+    (high == low) с вечера пятницы и в воскресенье по UTC — рынок закрыт,
+    Pocket Option просто повторяет последнюю цену."""
+    t = datetime.fromtimestamp(int(c["time"]), timezone.utc)
+    wd = t.weekday()
+    if wd == 5:
+        return True
+    if c["high"] == c["low"] and (wd == 6 or (wd == 4 and t.hour >= 20)):
+        return True
+    return False
+
+
 async def _push_tick(asset_key: str, price: float, ts: float):
     if is_weekend():
         return                                  # выходные — котировки фальшивые (застывшие)
@@ -295,7 +322,8 @@ async def _push_tick(asset_key: str, price: float, ts: float):
 async def _seed_candles(asset_key: str, period: int, candles: list[dict]):
     """Вливает историю в хранилище. Для закрытых свечей история точнее
     (живая свеча могла начаться с середины, H1 могла быть собрана из M5),
-    поэтому побеждает история. Текущая формирующаяся свеча — всегда живая."""
+    поэтому побеждает история. Текущая формирующаяся свеча — всегда живая.
+    Выходные «плоские» свечи выбрасываются (и из истории, и из уже накопленного)."""
     key = (asset_key, period)
     current_bucket = int(time.time() // period * period)
     async with _store_lock:
@@ -304,8 +332,12 @@ async def _seed_candles(asset_key: str, period: int, candles: list[dict]):
             if c["time"] == current_bucket and c["time"] in merged:
                 continue
             merged[c["time"]] = dict(c)
-        ordered = sorted(merged.values(), key=lambda c: c["time"])[-_maxlen(period):]
+        cleaned = [c for c in merged.values() if not _is_weekend_filler(c)]
+        dropped = len(merged) - len(cleaned)
+        ordered = sorted(cleaned, key=lambda c: c["time"])[-_maxlen(period):]
         candle_store[key] = deque(ordered, maxlen=_maxlen(period))
+    if dropped:
+        print(f"[history] {asset_key} {period // 60}м: выброшено выходных «плоских» свечей — {dropped}")
 
 
 async def _build_htf_from_ltf(asset_key: str):
@@ -339,6 +371,16 @@ async def _get_closed_frame(asset_key: str, period: int) -> pd.DataFrame | None:
     if not rows:
         return None
     return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def _tail_after_gap(df: pd.DataFrame, period: int) -> pd.DataFrame:
+    """Свечи после последней дыры в данных (перерыв котировок).
+    Уровни до перерыва для локального подтверждения M5 не используем."""
+    t = df["time"].values
+    for idx in range(len(t) - 1, 0, -1):
+        if t[idx] - t[idx - 1] > period:
+            return df.iloc[idx:].reset_index(drop=True)
+    return df
 
 
 async def _candle_count(asset_key: str, period: int) -> int:
@@ -454,12 +496,16 @@ def find_bullish_htf_setup(df: pd.DataFrame) -> dict | None:
     cl = df["close"].values
     hi = df["high"].values
     lo = df["low"].values
+    tm = df["time"].values
     avg_body = (df["close"] - df["open"]).abs().tail(50).mean()
     if avg_body <= 0:
         return None
 
     start = max(HTF_LIQ_LOOKBACK + 2, n - HTF_SETUP_LOOKBACK)
     for i in range(n - 1, start - 1, -1):
+        # три свечи FVG должны идти подряд — разрыв через дыру в данных не имбаланс
+        if tm[i] - tm[i - 2] != 2 * TF_HTF:
+            continue
         # FVG: минимум 3-й свечи выше максимума 1-й
         if lo[i] <= hi[i - 2]:
             continue
@@ -476,8 +522,7 @@ def find_bullish_htf_setup(df: pd.DataFrame) -> dict | None:
         # Снятие ликвидности перед импульсом.
         # Уровень ликвидности — ПОСЛЕДНИЙ подтверждённый swing-минимум (последний
         # откат HL внутри тренда), а не самый низкий минимум за 20 свечей:
-        # пробой суточного минимума в восходящем тренде — это уже слом тренда,
-        # поэтому раньше фильтр тренда отсекал почти все сетапы.
+        # пробой суточного минимума в восходящем тренде — это уже слом тренда.
         sweep = None
         lower = max(imp - HTF_SWEEP_MAX_BEFORE_IMPULSE, SWING_WING * 2 + 1)
         for j in range(imp, lower - 1, -1):
@@ -574,6 +619,16 @@ async def analyze_pair(asset) -> tuple[dict | None, str]:
     if age is None or age > STALE_TICKS_SECONDS:
         return None, "нет свежих котировок (рынок закрыт?)"
 
+    # Последняя закрытая M5 должна быть только что закрывшейся. Иначе после
+    # перерыва в котировках «слом структуры» проверялся бы на старой свече
+    # и сигнал «входи сейчас» пришёл бы по цене двухчасовой давности.
+    current_ltf = int(time.time() // TF_LTF * TF_LTF)
+    if int(ltf["time"].iloc[-1]) != current_ltf - TF_LTF:
+        return None, "M5: ждём первую закрытую свечу после перерыва в котировках"
+
+    # Для подтверждения на M5 берём только свечи после последнего перерыва
+    ltf_seg = _tail_after_gap(ltf, TF_LTF)
+
     # Проверяем обе стороны: покупку на исходном графике, продажу — на зеркальном.
     # Тренд оцениваем по структуре ДО снятия ликвидности: само снятие делает
     # новый минимум (максимум), и если смотреть после него, тренд «ломается».
@@ -604,7 +659,7 @@ async def analyze_pair(asset) -> tuple[dict | None, str]:
         if setup_id in used_setups:
             reason = reason or "по этому FVG сигнал уже был"
             continue
-        lt = ltf if sign == 1 else _mirror(ltf)
+        lt = ltf_seg if sign == 1 else _mirror(ltf_seg)
         conf = find_bullish_ltf_confirmation(lt, setup["fvg_bottom"], setup["fvg_top"])
         if conf is None:
             reason = reason or f"H1 {t_label}, FVG есть — ждём возврата и слома структуры на M5"
@@ -789,6 +844,7 @@ _HISTORY_FIELD_ALIASES = {
     "index": ("index", "request_id", "req_id", "id"),
 }
 _history_api_logged = False
+_raw_sample_logged: set[int] = set()          # периоды, для которых уже показали пример ответа
 _pending_history: deque = deque(maxlen=200)   # (asset_key, period) в порядке запросов
 
 
@@ -933,54 +989,6 @@ def _get_field(obj, *names):
     return None
 
 
-async def _on_history_event(payload):
-    """Ответ с историей, пришедший отдельным событием от сервера."""
-    try:
-        raw_asset = _get_field(payload, "asset", "symbol", "active")
-        period = _get_field(payload, "period", "timeframe")
-        asset_key = _asset_key(raw_asset) if raw_asset is not None else None
-        period = int(period) if period is not None else None
-
-        if asset_key is None or period is None:
-            pending = _take_pending(asset_key, period)
-            if pending is None:
-                print(f"[history] Событие без актива/периода, тип {type(payload).__name__}")
-                return
-            asset_key = asset_key or pending[0]
-            period = period or pending[1]
-        else:
-            _take_pending(asset_key, period)   # ответ пришёл — убираем запрос из очереди
-
-        parsed = _parse_history(payload, period)
-        if not parsed:
-            print(f"[history] Событие: пусто для {asset_key} {period // 60}м")
-            return
-        await _seed_candles(asset_key, period, parsed)
-        print(f"[history] Событие: подгружено {asset_key} {period // 60}м — свечей {len(parsed)}")
-        if period == TF_LTF and await _candle_count(asset_key, TF_HTF) < MIN_HTF_CANDLES:
-            built = await _build_htf_from_ltf(asset_key)
-            print(f"[history] {asset_key}: H1 собран из M5 — {built} свечей")
-    except Exception as error:
-        print(f"[history] Ошибка обработки события истории: {error}")
-
-
-def _register_history_events(client):
-    """Подписываемся на все события библиотеки, похожие на ответ с историей."""
-    on = client.on
-    names = [n for n in dir(on) if not n.startswith("_")]
-    print(f"[history] События библиотеки: {', '.join(names)}")
-    hooked = []
-    for name in names:
-        low = name.lower()
-        if "history" in low or "candle" in low:
-            try:
-                getattr(on, name)(_on_history_event)
-                hooked.append(name)
-            except Exception as error:
-                print(f"[history] Не удалось подписаться на {name}: {error}")
-    print(f"[history] Подписка на ответы истории: {', '.join(hooked) or 'нет подходящих событий'}")
-
-
 def _to_unix(value) -> int:
     if isinstance(value, datetime):
         return int(value.timestamp())
@@ -990,16 +998,61 @@ def _to_unix(value) -> int:
     return int(value)
 
 
-def _parse_history(result, period: int) -> list[dict]:
-    """Понимает разные форматы ответа: объекты/словари свечей,
-    списки [time, open, close, high, low] и просто тики [time, price]."""
+def _raw_items(result) -> list:
+    """Достаёт из ответа истории сам список свечей/тиков."""
     raw = result
     for attr in ("candles", "data", "history"):
         value = result.get(attr) if isinstance(result, dict) else getattr(result, attr, None)
         if value:
             raw = value
             break
-    if not isinstance(raw, (list, tuple)):
+    return list(raw) if isinstance(raw, (list, tuple)) else []
+
+
+def _item_time(item):
+    if isinstance(item, dict):
+        return item.get("time")
+    if isinstance(item, (list, tuple)):
+        return item[0] if item else None
+    return getattr(item, "time", None)
+
+
+def _history_step(result) -> int | None:
+    """Типичный шаг по времени между элементами ответа (сек): 60 — минутки/тики,
+    3600 — часовые свечи. Нужен, чтобы понять, можно ли из ответа собрать M5."""
+    times = []
+    for item in _raw_items(result)[:300]:
+        try:
+            t = _item_time(item)
+            if t is not None:
+                times.append(_to_unix(t))
+        except Exception:
+            continue
+    times = sorted(set(times))
+    if len(times) < 3:
+        return None
+    diffs = sorted(b - a for a, b in zip(times, times[1:]))
+    return diffs[len(diffs) // 2]
+
+
+def _log_raw_sample(result, period: int):
+    """Один раз на таймфрейм показывает в логах, как выглядит ответ истории."""
+    if period in _raw_sample_logged or result is None:
+        return
+    _raw_sample_logged.add(period)
+    items = _raw_items(result)
+    sample = ", ".join(repr(x)[:120] for x in items[:2])
+    print(
+        f"[history] Пример ответа {period // 60}м: тип {type(result).__name__}, "
+        f"элементов {len(items)}, шаг {_history_step(result)} сек, первые: {sample or '—'}"
+    )
+
+
+def _parse_history(result, period: int) -> list[dict]:
+    """Понимает разные форматы ответа: объекты/словари свечей,
+    списки [time, open, close, high, low] и просто тики [time, price]."""
+    raw = _raw_items(result)
+    if not raw:
         return []
 
     candles: dict[int, dict] = {}
@@ -1037,19 +1090,94 @@ def _parse_history(result, period: int) -> list[dict]:
     return sorted(candles.values(), key=lambda c: c["time"])
 
 
+async def _ingest_history(asset_key: str, period: int, result, source: str) -> int:
+    """Разбирает ответ истории и вливает его в хранилище.
+    Если ответ на запрос H1 пришёл мелкими свечами или тиками —
+    из него же собирается M5 (M5-история у Pocket Option приходит не всегда)."""
+    _log_raw_sample(result, period)
+    parsed = _parse_history(result, period)
+    if not parsed:
+        return 0
+    await _seed_candles(asset_key, period, parsed)
+    print(f"[history] {source}: подгружено {asset_key} {period // 60}м — свечей {len(parsed)}")
+
+    if period == TF_HTF:
+        step = _history_step(result)
+        if step is not None and step <= TF_LTF:
+            fine = _parse_history(result, TF_LTF)
+            if fine:
+                await _seed_candles(asset_key, TF_LTF, fine)
+                print(f"[history] {asset_key}: M5 собран из той же истории — свечей {len(fine)}")
+
+    if period == TF_LTF and await _candle_count(asset_key, TF_HTF) < MIN_HTF_CANDLES:
+        built = await _build_htf_from_ltf(asset_key)
+        print(f"[history] {asset_key}: H1 собран из M5 — {built} свечей")
+    return len(parsed)
+
+
+async def _on_history_event(payload):
+    """Ответ с историей, пришедший отдельным событием от сервера."""
+    try:
+        raw_asset = _get_field(payload, "asset", "symbol", "active")
+        period = _get_field(payload, "period", "timeframe")
+        asset_key = _asset_key(raw_asset) if raw_asset is not None else None
+        period = int(period) if period is not None else None
+
+        if asset_key is None or period is None:
+            pending = _take_pending(asset_key, period)
+            if pending is None:
+                print(f"[history] Событие без актива/периода, тип {type(payload).__name__}")
+                return
+            asset_key = asset_key or pending[0]
+            period = period or pending[1]
+        else:
+            _take_pending(asset_key, period)   # ответ пришёл — убираем запрос из очереди
+
+        got = await _ingest_history(asset_key, period, payload, "Событие")
+        if not got:
+            print(f"[history] Событие: пусто для {asset_key} {period // 60}м")
+    except Exception as error:
+        print(f"[history] Ошибка обработки события истории: {error}")
+
+
+def _register_history_events(client):
+    """Подписываемся на все события библиотеки, похожие на ответ с историей."""
+    on = client.on
+    names = [n for n in dir(on) if not n.startswith("_")]
+    print(f"[history] События библиотеки: {', '.join(names)}")
+    hooked = []
+    for name in names:
+        low = name.lower()
+        if "history" in low or "candle" in low:
+            try:
+                getattr(on, name)(_on_history_event)
+                hooked.append(name)
+            except Exception as error:
+                print(f"[history] Не удалось подписаться на {name}: {error}")
+    print(f"[history] Подписка на ответы истории: {', '.join(hooked) or 'нет подходящих событий'}")
+
+
 HISTORY_RETRIES = 3
+
+
+def _history_count(period: int, attempt: int) -> int:
+    """Глубина запроса истории. Для M5 с каждой попыткой меньше:
+    сервер может не отдавать слишком глубокую M5-историю."""
+    if period == TF_HTF:
+        return HISTORY_HTF_COUNT
+    return HISTORY_LTF_COUNTS[min(max(attempt, 1) - 1, len(HISTORY_LTF_COUNTS) - 1)]
 
 
 async def _request_history(asset, period: int, count: int):
     asset_key = _asset_key(asset)
     try:
         result = await _call_load_history(asset, period, count)
-        parsed = _parse_history(result, period) if result is not None else []
-        if parsed:
-            await _seed_candles(asset_key, period, parsed)
-            print(f"[history] Подгружено: {asset_key} {period // 60}м — свечей {len(parsed)}")
-        elif result is not None:
-            print(f"[history] Ответ без свечей: {asset_key} {period // 60}м, тип {type(result).__name__}")
+        if result is None:
+            return
+        got = await _ingest_history(asset_key, period, result, "Ответ")
+        if not got:
+            print(f"[history] Ответ без свечей: {asset_key} {period // 60}м "
+                  f"(глубина {count}), тип {type(result).__name__}")
     except Exception as error:
         print(f"[history] Не удалось: {asset_key} {period // 60}м: {error} — копим вживую.")
 
@@ -1064,6 +1192,8 @@ async def _missing_periods(asset_key: str) -> list[int]:
 
 
 async def _try_preload_history(assets: list):
+    """Первая попытка — все пары и оба ТФ (это же закрывает дыры после перерыва),
+    дальше — только то, чего не хватает."""
     plan = {_asset_key(a): (a, [TF_LTF, TF_HTF]) for a in assets}
 
     for attempt in range(1, HISTORY_RETRIES + 1):
@@ -1073,8 +1203,7 @@ async def _try_preload_history(assets: list):
 
         for asset, periods in plan.values():
             for period in periods:
-                count = HISTORY_LTF_COUNT if period == TF_LTF else HISTORY_HTF_COUNT
-                await _request_history(asset, period, count)
+                await _request_history(asset, period, _history_count(period, attempt))
                 await asyncio.sleep(0.5)   # не заваливаем сервер запросами
 
         await asyncio.sleep(10)            # даём время прийти ответам-событиям
@@ -1105,6 +1234,7 @@ async def _try_preload_history(assets: list):
 async def _history_retry_loop():
     """Каждые 15 минут пробует догрузить историю для пар, где её не хватает
     (например NZDUSD). Когда пара готова — сообщает в Telegram."""
+    global _bg_history_round
     while True:
         await asyncio.sleep(HISTORY_BG_RETRY_MINUTES * 60)
         try:
@@ -1118,14 +1248,15 @@ async def _history_retry_loop():
             if not todo:
                 continue
 
+            _bg_history_round += 1
+            attempt = (_bg_history_round - 1) % len(HISTORY_LTF_COUNTS) + 1
             names = ", ".join(
                 f"{_asset_key(a)} ({'/'.join(str(p // 60) + 'м' for p in ps)})" for a, ps in todo
             )
-            print(f"[history] Фоновая догрузка: {names}")
+            print(f"[history] Фоновая догрузка (глубина M5 {_history_count(TF_LTF, attempt)}): {names}")
             for a, periods in todo:
                 for period in periods:
-                    count = HISTORY_LTF_COUNT if period == TF_LTF else HISTORY_HTF_COUNT
-                    await _request_history(a, period, count)
+                    await _request_history(a, period, _history_count(period, attempt))
                     await asyncio.sleep(0.5)
             await asyncio.sleep(10)
 
@@ -1179,18 +1310,41 @@ async def _heartbeat_loop():
 
 
 async def _tick_watchdog_loop():
-    """Если в рабочее время ни по одной паре нет котировок дольше 10 минут —
-    пишет в Telegram. Когда котировки вернулись — тоже пишет."""
-    global _ticks_alert_sent
+    """Раз в минуту:
+    - в будни отслеживает паузы в котировках по всем парам; когда котировки
+      вернулись после паузы > 5 мин — догружает историю, чтобы закрыть дыру;
+    - в рабочее время пишет в Telegram, если котировок нет > 10 мин, и когда вернулись;
+    - в рабочее время пишет, если отдельная пара молчит > 30 мин, а остальные работают."""
+    global _ticks_alert_sent, _quotes_gap_started
     while True:
         await asyncio.sleep(60)
         try:
-            if not is_within_working_hours() or not ACTIVE_ASSETS:
+            if is_weekend() or not ACTIVE_ASSETS:
                 continue
             if time.time() - _started_at < TICK_ALERT_SECONDS:
                 continue                        # сразу после старта даём время подключиться
-            ages = [await _tick_age(_asset_key(a)) for a in ACTIVE_ASSETS]
-            live = [x for x in ages if x is not None and x <= TICK_ALERT_SECONDS]
+
+            ages = {_asset_key(a): await _tick_age(_asset_key(a)) for a in ACTIVE_ASSETS}
+            known = [x for x in ages.values() if x is not None]
+            freshest = min(known) if known else None
+
+            # --- паузы в котировках и догрузка истории после них ---
+            paused = freshest is None or freshest > GAP_BACKFILL_SECONDS
+            if paused and _quotes_gap_started is None:
+                _quotes_gap_started = time.time() - (freshest or 0)
+                print("[watchdog] Котировки по всем парам остановились.")
+            elif not paused and _quotes_gap_started is not None:
+                minutes = int((time.time() - _quotes_gap_started) / 60)
+                _quotes_gap_started = None
+                print(f"[watchdog] Котировки вернулись после паузы ~{minutes} мин — догружаю историю.")
+                if po_connected:
+                    _background_tasks.append(asyncio.create_task(_try_preload_history(ACTIVE_ASSETS)))
+
+            if not is_within_working_hours():
+                continue
+
+            # --- все пары молчат ---
+            live = [k for k, x in ages.items() if x is not None and x <= TICK_ALERT_SECONDS]
             if not live and not _ticks_alert_sent:
                 _ticks_alert_sent = True
                 print("[watchdog] Котировки не приходят больше 10 минут.")
@@ -1203,6 +1357,23 @@ async def _tick_watchdog_loop():
                 _ticks_alert_sent = False
                 print("[watchdog] Котировки снова идут.")
                 await _notify(f"✅ Котировки снова идут ({len(live)}/{len(ACTIVE_ASSETS)} пар).")
+
+            # --- отдельная пара молчит, остальные работают ---
+            if time.time() - _started_at < PAIR_SILENT_SECONDS or len(live) * 2 < len(ACTIVE_ASSETS):
+                continue
+            for k, age in ages.items():
+                silent = age is None or age > PAIR_SILENT_SECONDS
+                if silent and k not in _silent_pairs_notified:
+                    _silent_pairs_notified.add(k)
+                    print(f"[watchdog] {k}: котировки не приходят, остальные пары работают.")
+                    await _notify(
+                        f"⚠️ {_pair_label(k)}: котировки не приходят больше 30 минут, "
+                        "хотя остальные пары работают. Похоже, Pocket Option сейчас не даёт "
+                        "реальную (не OTC) котировку этой пары — сигналов по ней не будет."
+                    )
+                elif not silent and k in _silent_pairs_notified:
+                    _silent_pairs_notified.discard(k)
+                    await _notify(f"✅ {_pair_label(k)}: котировки пошли.")
         except Exception as error:
             print(f"[watchdog] Ошибка: {error}")
 
@@ -1267,7 +1438,7 @@ async def start_pocket_option_client():
         print("Pocket Option: соединение установлено (демо).")
         if was_reconnect:
             await _notify("✅ Соединение с Pocket Option восстановлено.")
-        asyncio.create_task(_try_preload_history(ACTIVE_ASSETS))
+        _background_tasks.append(asyncio.create_task(_try_preload_history(ACTIVE_ASSETS)))
 
     @po_client.on.disconnect
     async def _on_disconnect():
@@ -1307,7 +1478,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif is_within_working_hours():
         window = "🟢 сейчас в рабочем окне"
     else:
-        window = "🔴 сейчас вне рабочего окна (бот молчит)"
+        window = "🔴 сейчас вне рабочего окна (сигналов нет, свечи копятся)"
     breaker = "\n⚠️ Circuit breaker активен (низкая точность)" if _circuit_breaker_active else ""
 
     if _last_analysis_at is None:
@@ -1334,7 +1505,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ FELIX SMART BOT работает\n\n"
         f"{po_line}\n{auto_line}\n{market_line}\n{analysis_line}\n"
         f"⏱ Работает без перезапуска: {uptime_h:.1f} ч | сигналов: {len(signal_history)}\n"
-        f"🕐 Рабочее окно: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 (Берген), сб–вс выходной\n"
+        f"🕐 Сигналы: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 (Берген), сб–вс выходной\n"
         f"{window}{breaker}\n\n"
         f"Пары: {pairs}\n"
         f"Стратегия: «Не заходи раньше» (SMC), H1 + M5\n"
@@ -1386,7 +1557,8 @@ async def candles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         h1 = await _candle_count(k, TF_HTF)
         age = await _tick_age(k)
         ready = "✅" if m5 >= MIN_LTF_CANDLES and h1 >= MIN_HTF_CANDLES else "⏳"
-        lines.append(f"{ready} {_pair_label(k)}: M5 {m5} | H1 {h1} | {_age_text(age)}")
+        silent = " | 🔇 пара молчит" if k in _silent_pairs_notified else ""
+        lines.append(f"{ready} {_pair_label(k)}: M5 {m5} | H1 {h1} | {_age_text(age)}{silent}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1409,7 +1581,7 @@ async def strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Экспирация {EXPIRATION_MINUTES} мин. Статистика через "
         f"{', '.join(str(h) for h in CHECK_HORIZONS)} мин — /stats.\n"
         "Один FVG = максимум один сигнал.\n"
-        f"Работа: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену, сб–вс выходной."
+        f"Сигналы: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену, сб–вс выходной."
     )
 
 
@@ -1530,7 +1702,8 @@ async def post_init(application: Application):
             "Стратегия «Не заходи раньше» (SMC): H1 + M5, реальные валютные пары.\n"
             f"Экспирация {EXPIRATION_MINUTES} мин, статистика через "
             f"{', '.join(str(h) for h in CHECK_HORIZONS)} мин.\n"
-            f"Рабочее окно: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену, сб–вс выходной.\n\n"
+            f"Сигналы: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену, сб–вс выходной.\n"
+            "Свечи в будни копятся круглосуточно — это нужно для структуры H1.\n\n"
             "🕯 Проверить, копятся ли свечи — кнопка «Свечи» или /candles.\n"
             "В выходные бот молчит и не строит свечи из застывших котировок.\n"
             "Если котировки пропадут больше чем на 10 минут в рабочее время — напишу сюда."
