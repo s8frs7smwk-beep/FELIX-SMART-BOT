@@ -31,6 +31,15 @@ M5 (пока цена вернулась в FVG):
 последнюю цену. Бот игнорирует тики в субботу/воскресенье, а котировку считает
 живой, только если цена реально меняется — иначе «рынок закрыт».
 
+НАДЁЖНОСТЬ И ДИАГНОСТИКА:
+- фоновая догрузка истории каждые 15 мин для пар, где она не пришла при старте;
+- лог «[alive]» в Railway: через 5 мин после старта и дальше раз в час —
+  соединение, свечи, возраст тика и текущий этап SMC по каждой паре;
+- лог «[smc]» при каждой смене этапа по паре (видно, что отсекает сетапы);
+- сообщение в Telegram, если в рабочее время котировки не приходят > 10 мин,
+  и сообщение, когда они вернулись;
+- ошибки Telegram (в т.ч. Conflict) пишутся в лог коротко, без падения.
+
 Исправления библиотеки pocket_option (перенесены из рабочего кода):
 - патч fix_timestamp (TypeError: Unsupported type: <class 'int'>);
 - единый ключ актива в хранилище свечей и в анализе;
@@ -51,6 +60,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from telegram import Update, ReplyKeyboardMarkup
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 from pocket_option import PocketOptionClient
@@ -163,6 +173,11 @@ WEEKEND_DAYS = (5, 6)          # суббота, воскресенье — вы
 
 STALE_TICKS_SECONDS = 300      # цена не менялась дольше 5 мин — считаем, что рынок закрыт
 
+HISTORY_BG_RETRY_MINUTES = 15  # фоновая догрузка истории для пар, где она не пришла
+HEARTBEAT_FIRST_MINUTES = 5    # первый лог «[alive]» после старта
+HEARTBEAT_MINUTES = 60         # дальше лог «[alive]» раз в час
+TICK_ALERT_SECONDS = 600       # нет котировок > 10 мин в рабочее время — сообщение в Telegram
+
 # ---------------------------------------------------------------------------
 # СОСТОЯНИЕ
 # ---------------------------------------------------------------------------
@@ -181,6 +196,12 @@ _notify_bot = None
 _notify_chat_id: int | None = None
 _circuit_breaker_active = False
 
+_started_at = time.time()
+last_reason: dict[str, str] = {}              # asset_key -> последний этап SMC
+_last_analysis_at: float | None = None
+_ticks_alert_sent = False
+_background_tasks: list = []                  # ссылки на фоновые задачи, чтобы их не собрал GC
+
 
 def _asset_key(asset) -> str:
     return asset.value if hasattr(asset, "value") else str(asset)
@@ -192,6 +213,14 @@ def _pair_label(asset_key: str) -> str:
 
 def _price_fmt(asset_key: str, price: float) -> str:
     return f"{price:.3f}" if "JPY" in asset_key.upper() else f"{price:.5f}"
+
+
+def _age_text(age: float | None) -> str:
+    if age is None:
+        return "котировок не было"
+    if age < 60:
+        return f"тик {int(age)} сек назад"
+    return f"тик {int(age // 60)} мин назад"
 
 
 def resolve_pairs() -> list[str]:
@@ -346,6 +375,13 @@ async def _notify(text: str):
         await _notify_bot.send_message(chat_id=_notify_chat_id, text=text)
     except Exception as error:
         print(f"Не удалось отправить уведомление: {error}")
+
+
+def _remember_reason(asset_key: str, reason: str):
+    """Пишет в лог этап SMC по паре — только когда он меняется, без спама."""
+    if last_reason.get(asset_key) != reason:
+        last_reason[asset_key] = reason
+        print(f"[smc] {_pair_label(asset_key)}: {reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +659,7 @@ async def record_signal(signal: dict):
             "entry": signal["entry"],
             "results": {h: None for h in CHECK_HORIZONS},
         })
+    print(f"[signal] {_pair_label(signal['asset'])} {signal['direction']} по {signal['entry']}")
 
 
 def _judge(direction: str, entry: float, price: float) -> str:
@@ -727,6 +764,21 @@ _history_api_logged = False
 _pending_history: deque = deque(maxlen=200)   # (asset_key, period) в порядке запросов
 
 
+def _take_pending(asset_key: str | None = None, period: int | None = None):
+    """Достаёт из очереди ожидающий запрос истории. Если актив/период известны —
+    ищет именно его, а не берёт первый попавшийся: иначе запрос без ответа
+    (как у NZDUSD) сдвигал бы очередь и ответы приписывались бы не тем парам."""
+    if not _pending_history:
+        return None
+    if asset_key is None and period is None:
+        return _pending_history.popleft()
+    for i, item in enumerate(_pending_history):
+        if (asset_key is None or item[0] == asset_key) and (period is None or item[1] == period):
+            del _pending_history[i]
+            return item
+    return None
+
+
 def _history_request_model(func):
     """load_history_period принимает ОДИН аргумент — объект запроса.
     Достаём его тип из аннотации функции (обычно это pydantic-модель)."""
@@ -829,17 +881,17 @@ async def _call_load_history(asset, period: int, count: int):
         _history_api_logged = True
         _log_history_api(func, model)
 
+    asset_key = _asset_key(asset)
     last_error = None
     for payload in _build_history_payloads(model, asset, period, count):
         try:
-            _pending_history.append((_asset_key(asset), period))
+            _pending_history.append((asset_key, period))
             return await asyncio.wait_for(func(payload), timeout=HISTORY_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             # запрос ушёл, но ответ не вернулся из функции — возможно, он придёт событием
             return None
         except Exception as error:
-            if _pending_history:
-                _pending_history.pop()
+            _take_pending(asset_key, period)
             last_error = error
             continue
     raise last_error or RuntimeError("не удалось собрать запрос истории")
@@ -859,14 +911,18 @@ async def _on_history_event(payload):
         raw_asset = _get_field(payload, "asset", "symbol", "active")
         period = _get_field(payload, "period", "timeframe")
         asset_key = _asset_key(raw_asset) if raw_asset is not None else None
+        period = int(period) if period is not None else None
+
         if asset_key is None or period is None:
-            if not _pending_history:
+            pending = _take_pending(asset_key, period)
+            if pending is None:
                 print(f"[history] Событие без актива/периода, тип {type(payload).__name__}")
                 return
-            p_asset, p_period = _pending_history.popleft()
-            asset_key = asset_key or p_asset
-            period = period or p_period
-        period = int(period)
+            asset_key = asset_key or pending[0]
+            period = period or pending[1]
+        else:
+            _take_pending(asset_key, period)   # ответ пришёл — убираем запрос из очереди
+
         parsed = _parse_history(payload, period)
         if not parsed:
             print(f"[history] Событие: пусто для {asset_key} {period // 60}м")
@@ -970,6 +1026,15 @@ async def _request_history(asset, period: int, count: int):
         print(f"[history] Не удалось: {asset_key} {period // 60}м: {error} — копим вживую.")
 
 
+async def _missing_periods(asset_key: str) -> list[int]:
+    missing = []
+    if await _candle_count(asset_key, TF_LTF) < MIN_LTF_CANDLES:
+        missing.append(TF_LTF)
+    if await _candle_count(asset_key, TF_HTF) < MIN_HTF_CANDLES:
+        missing.append(TF_HTF)
+    return missing
+
+
 async def _try_preload_history(assets: list):
     plan = {_asset_key(a): (a, [TF_LTF, TF_HTF]) for a in assets}
 
@@ -988,11 +1053,7 @@ async def _try_preload_history(assets: list):
 
         next_plan = {}
         for key, (asset, _) in plan.items():
-            missing = []
-            if await _candle_count(key, TF_LTF) < MIN_LTF_CANDLES:
-                missing.append(TF_LTF)
-            if await _candle_count(key, TF_HTF) < MIN_HTF_CANDLES:
-                missing.append(TF_HTF)
+            missing = await _missing_periods(key)
             if missing:
                 next_plan[key] = (asset, missing)
         plan = next_plan
@@ -1007,6 +1068,115 @@ async def _try_preload_history(assets: list):
             h1 = await _build_htf_from_ltf(key)
         ready = "✅" if m5 >= MIN_LTF_CANDLES and h1 >= MIN_HTF_CANDLES else "⏳ копим вживую"
         print(f"[history] Итог {key}: M5 {m5} | H1 {h1} {ready}")
+
+
+# ---------------------------------------------------------------------------
+# ФОНОВЫЕ ПРОВЕРКИ: догрузка истории, лог «жив», контроль котировок
+# ---------------------------------------------------------------------------
+
+async def _history_retry_loop():
+    """Каждые 15 минут пробует догрузить историю для пар, где её не хватает
+    (например NZDUSD). Когда пара готова — сообщает в Telegram."""
+    while True:
+        await asyncio.sleep(HISTORY_BG_RETRY_MINUTES * 60)
+        try:
+            if not po_connected or is_weekend() or not ACTIVE_ASSETS:
+                continue
+            todo = []
+            for a in ACTIVE_ASSETS:
+                periods = await _missing_periods(_asset_key(a))
+                if periods:
+                    todo.append((a, periods))
+            if not todo:
+                continue
+
+            names = ", ".join(
+                f"{_asset_key(a)} ({'/'.join(str(p // 60) + 'м' for p in ps)})" for a, ps in todo
+            )
+            print(f"[history] Фоновая догрузка: {names}")
+            for a, periods in todo:
+                for period in periods:
+                    count = HISTORY_LTF_COUNT if period == TF_LTF else HISTORY_HTF_COUNT
+                    await _request_history(a, period, count)
+                    await asyncio.sleep(0.5)
+            await asyncio.sleep(10)
+
+            for a, _ in todo:
+                key = _asset_key(a)
+                m5 = await _candle_count(key, TF_LTF)
+                h1 = await _candle_count(key, TF_HTF)
+                if h1 < MIN_HTF_CANDLES and m5 > h1:
+                    h1 = await _build_htf_from_ltf(key)
+                ready = m5 >= MIN_LTF_CANDLES and h1 >= MIN_HTF_CANDLES
+                print(f"[history] После догрузки {key}: M5 {m5} | H1 {h1} {'✅' if ready else '⏳'}")
+                if ready:
+                    await _notify(f"✅ {_pair_label(key)}: история загрузилась (M5 {m5} | H1 {h1}), пара в работе.")
+        except Exception as error:
+            print(f"[history] Ошибка фоновой догрузки: {error}")
+
+
+async def _log_heartbeat():
+    now_local = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    if is_weekend():
+        window = "выходной"
+    elif is_within_working_hours():
+        window = "рабочее окно"
+    else:
+        window = "вне рабочего окна"
+    if _last_analysis_at is None:
+        analysis = "автоанализ ещё не запускался"
+    else:
+        analysis = f"последний автоанализ {int(time.time() - _last_analysis_at)} сек назад"
+    print(
+        f"[alive] {now_local} (Берген) | Pocket Option: {'подключено' if po_connected else 'НЕТ соединения'} | "
+        f"{window} | {analysis} | сигналов за сессию: {len(signal_history)}"
+    )
+    for a in ACTIVE_ASSETS:
+        k = _asset_key(a)
+        m5 = await _candle_count(k, TF_LTF)
+        h1 = await _candle_count(k, TF_HTF)
+        age = await _tick_age(k)
+        reason = last_reason.get(k, "—")
+        print(f"[alive] {_pair_label(k)}: M5 {m5} | H1 {h1} | {_age_text(age)} | {reason}")
+
+
+async def _heartbeat_loop():
+    await asyncio.sleep(HEARTBEAT_FIRST_MINUTES * 60)
+    while True:
+        try:
+            await _log_heartbeat()
+        except Exception as error:
+            print(f"[alive] Ошибка: {error}")
+        await asyncio.sleep(HEARTBEAT_MINUTES * 60)
+
+
+async def _tick_watchdog_loop():
+    """Если в рабочее время ни по одной паре нет котировок дольше 10 минут —
+    пишет в Telegram. Когда котировки вернулись — тоже пишет."""
+    global _ticks_alert_sent
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not is_within_working_hours() or not ACTIVE_ASSETS:
+                continue
+            if time.time() - _started_at < TICK_ALERT_SECONDS:
+                continue                        # сразу после старта даём время подключиться
+            ages = [await _tick_age(_asset_key(a)) for a in ACTIVE_ASSETS]
+            live = [x for x in ages if x is not None and x <= TICK_ALERT_SECONDS]
+            if not live and not _ticks_alert_sent:
+                _ticks_alert_sent = True
+                print("[watchdog] Котировки не приходят больше 10 минут.")
+                await _notify(
+                    "⚠️ Котировки Pocket Option не приходят больше 10 минут — анализ стоит.\n"
+                    f"Pocket Option: {'подключено' if po_connected else 'нет соединения'}.\n"
+                    "Если не восстановится — перезапусти деплой в Railway или проверь PO_SESSION."
+                )
+            elif live and _ticks_alert_sent:
+                _ticks_alert_sent = False
+                print("[watchdog] Котировки снова идут.")
+                await _notify(f"✅ Котировки снова идут ({len(live)}/{len(ACTIVE_ASSETS)} пар).")
+        except Exception as error:
+            print(f"[watchdog] Ошибка: {error}")
 
 
 async def start_pocket_option_client():
@@ -1112,6 +1282,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         window = "🔴 сейчас вне рабочего окна (бот молчит)"
     breaker = "\n⚠️ Circuit breaker активен (низкая точность)" if _circuit_breaker_active else ""
 
+    if _last_analysis_at is None:
+        analysis_line = "🔎 Автоанализ ещё не запускался"
+    else:
+        analysis_line = f"🔎 Последний автоанализ: {int(time.time() - _last_analysis_at)} сек назад"
+
     live = 0
     for a in ACTIVE_ASSETS:
         age = await _tick_age(_asset_key(a))
@@ -1125,9 +1300,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         market_line = "💤 Котировок нет — цена не меняется (рынок закрыт?)"
     pairs = ", ".join(_pair_label(_asset_key(a)) for a in ACTIVE_ASSETS) or "— ещё не найдены"
 
+    uptime_h = (time.time() - _started_at) / 3600
+
     await update.message.reply_text(
         "✅ FELIX SMART BOT работает\n\n"
-        f"{po_line}\n{auto_line}\n{market_line}\n"
+        f"{po_line}\n{auto_line}\n{market_line}\n{analysis_line}\n"
+        f"⏱ Работает без перезапуска: {uptime_h:.1f} ч | сигналов: {len(signal_history)}\n"
         f"🕐 Рабочее окно: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 (Берген), сб–вс выходной\n"
         f"{window}{breaker}\n\n"
         f"Пары: {pairs}\n"
@@ -1150,14 +1328,8 @@ async def candles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m5 = await _candle_count(k, TF_LTF)
         h1 = await _candle_count(k, TF_HTF)
         age = await _tick_age(k)
-        if age is None:
-            tick_txt = "котировок не было"
-        elif age < 60:
-            tick_txt = f"тик {int(age)} сек назад"
-        else:
-            tick_txt = f"тик {int(age // 60)} мин назад"
         ready = "✅" if m5 >= MIN_LTF_CANDLES and h1 >= MIN_HTF_CANDLES else "⏳"
-        lines.append(f"{ready} {_pair_label(k)}: M5 {m5} | H1 {h1} | {tick_txt}")
+        lines.append(f"{ready} {_pair_label(k)}: M5 {m5} | H1 {h1} | {_age_text(age)}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1191,24 +1363,29 @@ async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Анализирую пары...")
     report = []
     for a in ACTIVE_ASSETS:
+        k = _asset_key(a)
         signal, reason = await analyze_pair(a)
+        _remember_reason(k, reason)
         if signal:
             await update.message.reply_text(format_signal(signal))
             await record_signal(signal)
-        report.append(f"• {_pair_label(_asset_key(a))}: {reason}")
+        report.append(f"• {_pair_label(k)}: {reason}")
     await update.message.reply_text("Разбор по парам:\n" + "\n".join(report))
 
 
 async def auto_analysis(context: ContextTypes.DEFAULT_TYPE):
+    global _last_analysis_at
     try:
         await check_pending_outcomes()
         if not is_within_working_hours():
             return
         for a in ACTIVE_ASSETS:
-            signal, _ = await analyze_pair(a)
+            signal, reason = await analyze_pair(a)
+            _remember_reason(_asset_key(a), reason)
             if signal:
                 await context.bot.send_message(chat_id=context.job.chat_id, text=format_signal(signal))
                 await record_signal(signal)
+        _last_analysis_at = time.time()
     except Exception as error:
         print(f"Ошибка автоанализа: {error}")
 
@@ -1241,6 +1418,22 @@ async def auto_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⛔ Автоанализ остановлен.")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Ошибки Telegram — коротко в лог, без простыни traceback и без падения."""
+    err = context.error
+    if isinstance(err, Conflict):
+        print(
+            "[telegram] Conflict: этим токеном одновременно пользуется другая копия бота. "
+            "Пара таких строк во время передеплоя Railway — норма (старый контейнер ещё не выключился). "
+            "Если повторяется постоянно — где-то запущена вторая копия."
+        )
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        print(f"[telegram] Сетевая ошибка (повторим сами): {err}")
+        return
+    print(f"[telegram] Ошибка: {err!r}")
+
+
 MAIN_KEYBOARD = [
     ["📊 Статус", "📈 Стратегия"],
     ["🔍 Проверить сигнал", "🕯 Свечи"],
@@ -1261,7 +1454,10 @@ async def post_init(application: Application):
     if TELEGRAM_CHAT_ID:
         _notify_chat_id = int(TELEGRAM_CHAT_ID)
 
-    asyncio.create_task(start_pocket_option_client())
+    _background_tasks.append(asyncio.create_task(start_pocket_option_client()))
+    _background_tasks.append(asyncio.create_task(_history_retry_loop()))
+    _background_tasks.append(asyncio.create_task(_heartbeat_loop()))
+    _background_tasks.append(asyncio.create_task(_tick_watchdog_loop()))
 
     if not TELEGRAM_CHAT_ID:
         return
@@ -1279,7 +1475,8 @@ async def post_init(application: Application):
             f"{', '.join(str(h) for h in CHECK_HORIZONS)} мин.\n"
             f"Рабочее окно: пн–пт {WORK_START_HOUR:02d}:00–{WORK_END_HOUR:02d}:00 по Бергену, сб–вс выходной.\n\n"
             "🕯 Проверить, копятся ли свечи — кнопка «Свечи» или /candles.\n"
-            "В выходные бот молчит и не строит свечи из застывших котировок."
+            "В выходные бот молчит и не строит свечи из застывших котировок.\n"
+            "Если котировки пропадут больше чем на 10 минут в рабочее время — напишу сюда."
         ),
     )
 
@@ -1306,6 +1503,8 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^📉 Статистика$"), stats_cmd))
     application.add_handler(MessageHandler(filters.Regex("^▶️ Автоанализ$"), auto_start))
     application.add_handler(MessageHandler(filters.Regex("^⏹️ Стоп автоанализ$"), auto_stop))
+
+    application.add_error_handler(on_error)
 
     application.run_polling()
 
